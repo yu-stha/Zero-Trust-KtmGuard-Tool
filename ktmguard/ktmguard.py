@@ -197,6 +197,28 @@ def extract_edges_from_inbound_metrics(result, namespace, known_names):
     return [{"src": s, "dst": d} for (s, d) in sorted(edges.keys())]
 
 
+def extract_edges_from_outbound_metrics(result, namespace, known_names):
+    """Decode Linkerd outbound proxy metrics (outbound_http_route_request_statuses_total,
+    outbound_tcp_route_open_total, ...) into src -> dst edges. These are reported by
+    the CALLER's own proxy, using the `deployment` label (the caller) and the
+    `authority` label (the destination host:port it called) - this recovers edges
+    where the receiving side never got a usable client_id (e.g. no_tls_from_remote)."""
+    edges = {}
+    for item in result or []:
+        metric = item.get("metric", {})
+        src = metric.get("deployment")
+        authority = metric.get("authority")
+        if not src or not authority:
+            continue
+        dst = authority.split(":")[0]
+        if not dst or src == dst:
+            continue
+        if known_names and (src not in known_names or dst not in known_names):
+            continue
+        edges[(src, dst)] = True
+    return [{"src": s, "dst": d} for (s, d) in sorted(edges.keys())]
+
+
 def detect_communication_paths(prom_url, namespace, services):
     """Returns (edges, manual_review_required, warning_message)."""
     known_names = {s["name"] for s in services}
@@ -213,20 +235,33 @@ def detect_communication_paths(prom_url, namespace, services):
     # unauthenticated probe/health-check traffic with no client_id at all, so it
     # is only a secondary signal here. inbound_http_requests_total is tried as a
     # third fallback for versions that expose per-route HTTP metrics instead.
+    #
+    # Some connections never get a client_id on the receiving side at all
+    # (no_tls_reason="no_tls_from_remote") even though they're legitimate
+    # meshed traffic. For those, fall back to the CALLER's own outbound proxy
+    # metrics, which report `deployment` (the caller) and `authority`
+    # (the destination host:port) directly - no identity decoding needed.
     queries = [
-        f'tcp_open_connections{{namespace="{namespace}", direction="inbound"}}',
-        f'request_total{{namespace="{namespace}", direction="inbound"}}',
-        f'inbound_http_requests_total{{namespace="{namespace}"}}',
+        (f'tcp_open_connections{{namespace="{namespace}", direction="inbound"}}',
+         extract_edges_from_inbound_metrics),
+        (f'request_total{{namespace="{namespace}", direction="inbound"}}',
+         extract_edges_from_inbound_metrics),
+        (f'inbound_http_requests_total{{namespace="{namespace}"}}',
+         extract_edges_from_inbound_metrics),
+        (f'outbound_http_route_request_statuses_total{{namespace="{namespace}"}}',
+         extract_edges_from_outbound_metrics),
+        (f'outbound_tcp_route_open_total{{namespace="{namespace}"}}',
+         extract_edges_from_outbound_metrics),
     ]
 
     edges_by_pair = {}
     prometheus_reachable = False
-    for promql in queries:
+    for promql, extractor in queries:
         result = query_prometheus(prom_url, promql)
         if result is None:
             continue
         prometheus_reachable = True
-        for e in extract_edges_from_inbound_metrics(result, namespace, known_names):
+        for e in extractor(result, namespace, known_names):
             edges_by_pair[(e["src"], e["dst"])] = True
 
     if not prometheus_reachable:
