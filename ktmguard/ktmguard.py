@@ -10,7 +10,11 @@ AuthorizationPolicy YAML files.
 import argparse
 import json
 import os
+import shutil
+import subprocess
 import sys
+import threading
+import time
 from datetime import datetime, timezone
 
 import requests
@@ -118,6 +122,7 @@ def list_services(v1, namespace):
                 "port": p.port,
                 "target_port": p.target_port if p.target_port is not None else p.port,
                 "protocol": p.protocol or "TCP",
+                "node_port": getattr(p, "node_port", None),
             })
         selector = svc.spec.selector or {"app": svc.metadata.name}
         services.append({
@@ -295,6 +300,106 @@ def detect_communication_paths(prom_url, namespace, services):
 
 
 # --------------------------------------------------------------------------
+# Linkerd tap-based edge detection (optional, --tap)
+# --------------------------------------------------------------------------
+
+def _linkerd_cli_available():
+    return shutil.which("linkerd") is not None
+
+
+def _frontend_node_port(services):
+    for svc in services:
+        if svc["name"] != "frontend":
+            continue
+        for p in svc["ports"]:
+            if p.get("node_port"):
+                return p["node_port"]
+    return None
+
+
+def _generate_frontend_traffic(node_port, duration, stop_event):
+    """Best-effort background traffic generator: repeatedly hits the frontend's
+    NodePort so tap has something to observe without the user manually clicking
+    through the app. Assumes the NodePort is reachable at localhost, i.e. that
+    KTMGuard is running on a cluster node; silently gives up on request errors
+    since this is auxiliary, not required for tap itself to work."""
+    url = f"http://localhost:{node_port}/"
+    end_time = time.time() + duration
+    while time.time() < end_time and not stop_event.is_set():
+        try:
+            requests.get(url, timeout=2)
+        except requests.exceptions.RequestException:
+            pass
+        stop_event.wait(1)
+
+
+def run_linkerd_tap(namespace, duration, known_names, node_port=None):
+    """Runs `linkerd viz tap deploy -n <namespace> --output json` for `duration`
+    seconds and decodes each JSON tap event's source/destination deployment
+    into a src -> dst edge. Returns (edges, warning); on any failure to start
+    or find the CLI, returns ([], warning) so the caller can skip gracefully."""
+    if not _linkerd_cli_available():
+        return [], "linkerd CLI not found on PATH; skipping tap-based detection."
+
+    cmd = ["linkerd", "viz", "tap", "deploy", "-n", namespace, "--output", "json"]
+    try:
+        proc = subprocess.Popen(
+            cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
+        )
+    except OSError as exc:
+        return [], f"Failed to start 'linkerd viz tap': {exc}"
+
+    edges = {}
+    deadline = time.time() + duration
+
+    def reader():
+        for line in proc.stdout:
+            if time.time() > deadline:
+                break
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                event = json.loads(line)
+            except ValueError:
+                continue
+            src = event.get("source", {}).get("deployment")
+            dst = event.get("destination", {}).get("deployment")
+            if not src or not dst or src == dst:
+                continue
+            if known_names and (src not in known_names or dst not in known_names):
+                continue
+            edges[(src, dst)] = True
+
+    reader_thread = threading.Thread(target=reader, daemon=True)
+    reader_thread.start()
+
+    stop_event = threading.Event()
+    traffic_thread = None
+    if node_port:
+        traffic_thread = threading.Thread(
+            target=_generate_frontend_traffic,
+            args=(node_port, duration, stop_event),
+            daemon=True,
+        )
+        traffic_thread.start()
+
+    reader_thread.join(timeout=duration + 2)
+    stop_event.set()
+
+    proc.terminate()
+    try:
+        proc.wait(timeout=5)
+    except subprocess.TimeoutExpired:
+        proc.kill()
+    reader_thread.join(timeout=2)
+    if traffic_thread:
+        traffic_thread.join(timeout=5)
+
+    return [{"src": s, "dst": d} for (s, d) in sorted(edges.keys())], None
+
+
+# --------------------------------------------------------------------------
 # scan
 # --------------------------------------------------------------------------
 
@@ -312,11 +417,45 @@ def cmd_scan(args):
     print(f"Services found: {len(services)}")
     print()
 
+    known_names = {s["name"] for s in services}
+
+    tap_edges = []
+    if args.tap:
+        if not _linkerd_cli_available():
+            print(yellow(
+                "Warning: linkerd CLI not found on PATH; skipping tap-based detection."
+            ))
+            print()
+        else:
+            node_port = _frontend_node_port(services)
+            print(f"Observing live traffic for {args.tap_duration} seconds "
+                  "(move through the app to generate traffic)...")
+            if node_port:
+                print(f"Auto-generating traffic to frontend NodePort {node_port}.")
+            tap_edges, tap_warning = run_linkerd_tap(
+                args.namespace, args.tap_duration, known_names, node_port
+            )
+            if tap_warning:
+                print(yellow(f"Warning: {tap_warning}"))
+            print()
+
     edges, manual_review, warning = detect_communication_paths(
         args.prometheus, args.namespace, services
     )
 
+    if tap_edges:
+        combined = {(e["src"], e["dst"]): True for e in edges}
+        new_from_tap = sum(1 for e in tap_edges if (e["src"], e["dst"]) not in combined)
+        for e in tap_edges:
+            combined[(e["src"], e["dst"])] = True
+        edges = [{"src": s, "dst": d} for (s, d) in sorted(combined.keys())]
+        if new_from_tap:
+            print(f"Linkerd tap detected {new_from_tap} additional path(s) "
+                  "not seen in Prometheus metrics.")
+            print()
+
     if edges:
+        manual_review = False
         print("Detected communication paths:")
         for e in edges:
             print(f"  {e['src']:<22}→ {e['dst']}")
@@ -951,6 +1090,11 @@ def build_parser():
     p_scan = sub.add_parser("scan", help="Scan a namespace and detect service communication paths")
     p_scan.add_argument("--namespace", required=True)
     p_scan.add_argument("--prometheus", default=None, help="Prometheus base URL, e.g. http://localhost:9090")
+    p_scan.add_argument("--tap", action="store_true",
+                         help="Also observe live traffic via 'linkerd viz tap' to recover "
+                              "edges missing from Prometheus metrics")
+    p_scan.add_argument("--tap-duration", type=int, default=30,
+                         help="Seconds to observe traffic when --tap is set (default: 30)")
     p_scan.set_defaults(func=cmd_scan)
 
     p_gen = sub.add_parser("generate", help="Generate Zero Trust YAML configuration")
