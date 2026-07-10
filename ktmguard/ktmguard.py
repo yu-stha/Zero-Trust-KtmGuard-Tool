@@ -136,10 +136,6 @@ def list_deployments(apps_v1, namespace):
 # Prometheus querying / communication path detection
 # --------------------------------------------------------------------------
 
-SRC_LABEL_CANDIDATES = ["deployment", "workload", "src_service", "source"]
-DST_LABEL_CANDIDATES = ["dst_service", "authority", "destination", "remote_service"]
-
-
 def query_prometheus(prom_url, promql, timeout=5):
     try:
         resp = requests.get(
@@ -158,15 +154,41 @@ def query_prometheus(prom_url, promql, timeout=5):
         return None
 
 
-def extract_edges(result, known_names):
+IDENTITY_SUFFIX = ".serviceaccount.identity.linkerd.cluster.local"
+
+
+def _identity_to_name_and_namespace(identity):
+    """Decode a Linkerd mTLS identity like
+    'cartservice.boutique.serviceaccount.identity.linkerd.cluster.local'
+    into ('cartservice', 'boutique')."""
+    if not identity or not identity.endswith(IDENTITY_SUFFIX):
+        return None, None
+    prefix = identity[: -len(IDENTITY_SUFFIX)]
+    parts = prefix.split(".")
+    if len(parts) < 2:
+        return None, None
+    return parts[0], parts[1]
+
+
+CONTROL_PLANE_CLIENT_ID_MARKERS = ("prometheus", "linkerd-viz")
+
+
+def extract_edges_from_inbound_metrics(result, namespace, known_names):
+    """Decode Linkerd inbound proxy metrics (tcp_open_connections, request_total,
+    inbound_http_requests_total, ...) into src -> dst edges using the `deployment`
+    label (the receiver) and the `client_id` label (the caller's mTLS identity)."""
     edges = {}
     for item in result or []:
         metric = item.get("metric", {})
-        src = next((metric[k] for k in SRC_LABEL_CANDIDATES if k in metric), None)
-        dst = next((metric[k] for k in DST_LABEL_CANDIDATES if k in metric), None)
-        if not src or not dst:
+        dst = metric.get("deployment")
+        client_id = metric.get("client_id")
+        if not dst or not client_id:
             continue
-        dst = dst.split(".")[0].split(":")[0]  # strip namespace/port suffixes if present
+        if any(marker in client_id for marker in CONTROL_PLANE_CLIENT_ID_MARKERS):
+            continue
+        src, caller_namespace = _identity_to_name_and_namespace(client_id)
+        if not src or caller_namespace != namespace:
+            continue
         if src == dst:
             continue
         if known_names and (src not in known_names or dst not in known_names):
@@ -185,21 +207,36 @@ def detect_communication_paths(prom_url, namespace, services):
             "Manual review of communication paths is required."
         )
 
-    linkerd_query = (
-        f'sum by (deployment, dst_service) '
-        f'(linkerd_tcp_open_connections{{namespace="{namespace}"}})'
-    )
-    result = query_prometheus(prom_url, linkerd_query)
+    # tcp_open_connections is queried first: across observed Linkerd versions it
+    # reliably carries a client_id (caller mTLS identity) label for real
+    # app-to-app traffic. request_total's inbound series can be dominated by
+    # unauthenticated probe/health-check traffic with no client_id at all, so it
+    # is only a secondary signal here. inbound_http_requests_total is tried as a
+    # third fallback for versions that expose per-route HTTP metrics instead.
+    queries = [
+        f'tcp_open_connections{{namespace="{namespace}", direction="inbound"}}',
+        f'request_total{{namespace="{namespace}", direction="inbound"}}',
+        f'inbound_http_requests_total{{namespace="{namespace}"}}',
+    ]
 
-    if result is None:
+    edges_by_pair = {}
+    prometheus_reachable = False
+    for promql in queries:
+        result = query_prometheus(prom_url, promql)
+        if result is None:
+            continue
+        prometheus_reachable = True
+        for e in extract_edges_from_inbound_metrics(result, namespace, known_names):
+            edges_by_pair[(e["src"], e["dst"])] = True
+
+    if not prometheus_reachable:
         return [], True, (
             "Prometheus was not reachable; communication paths could not be "
             "auto-detected. Manual review required."
         )
 
-    edges = extract_edges(result, known_names)
-    if edges:
-        return edges, False, None
+    if edges_by_pair:
+        return [{"src": s, "dst": d} for (s, d) in sorted(edges_by_pair.keys())], False, None
 
     # Fall back to raw network byte counters as a weaker secondary signal.
     fallback_query = (
