@@ -33,6 +33,12 @@ if hasattr(sys.stdout, "reconfigure"):
     sys.stdout.reconfigure(encoding="utf-8", errors="replace")
 
 OUTPUT_DIR = "ktmguard-output"
+# `kubectl apply -f ktmguard-output/` walks the directory and picks up every
+# .yaml/.yml/.json file it finds (it filters by extension, not content) - a
+# .json state file sitting next to the generated policy YAML gets fed to
+# kubectl as if it were a manifest and fails to apply. State files therefore
+# live in a subfolder kubectl never gets pointed at.
+STATE_DIR = os.path.join(OUTPUT_DIR, ".state")
 LINE = "-" * 47
 
 
@@ -241,6 +247,20 @@ def detect_communication_paths(prom_url, namespace, services):
     # is only a secondary signal here. inbound_http_requests_total is tried as a
     # third fallback for versions that expose per-route HTTP metrics instead.
     #
+    # tcp_open_connections is a GAUGE: it only reflects connections open at the
+    # instant Prometheus scraped it. A client like cartservice's redis driver
+    # that opens a short-lived connection per call (rather than holding one
+    # open) can read back as 0 between scrapes even though calls are
+    # constantly happening. tcp_close_connections_total is the COUNTER
+    # equivalent - every closed connection increments it permanently, so it
+    # catches exactly the short-lived-connection case the gauge can miss, and
+    # it carries the same deployment/client_id labels. This matters most for
+    # opaque, non-HTTP ports (e.g. redis-cart:6379): `linkerd tap` only
+    # observes the HTTP request/response event stream inside a proxy, so raw
+    # TCP protocols it can't parse as HTTP produce no tap events at all - it's
+    # not a missing label, tap has nothing to report. These TCP-level metrics
+    # are the only detection path that can see that traffic.
+    #
     # Some connections never get a client_id on the receiving side at all
     # (no_tls_reason="no_tls_from_remote") even though they're legitimate
     # meshed traffic. For those, fall back to the CALLER's own outbound proxy
@@ -248,6 +268,8 @@ def detect_communication_paths(prom_url, namespace, services):
     # (the destination host:port) directly - no identity decoding needed.
     queries = [
         (f'tcp_open_connections{{namespace="{namespace}", direction="inbound"}}',
+         extract_edges_from_inbound_metrics),
+        (f'tcp_close_connections_total{{namespace="{namespace}", direction="inbound"}}',
          extract_edges_from_inbound_metrics),
         (f'request_total{{namespace="{namespace}", direction="inbound"}}',
          extract_edges_from_inbound_metrics),
@@ -317,17 +339,49 @@ def _frontend_node_port(services):
     return None
 
 
+# Well-known Online Boutique catalog product id (Sunglasses) - used by the
+# project's own load-testing scripts, stable across deployments of the demo app.
+CHECKOUT_PRODUCT_ID = "OLJCESPC7Z"
+
+CHECKOUT_FORM_DATA = {
+    "email": "someone@example.com",
+    "street_address": "1600 Amphitheatre Parkway",
+    "zip_code": "94043",
+    "city": "Mountain View",
+    "state": "CA",
+    "country": "United States",
+    "credit_card_number": "4432-8015-6152-0454",
+    "credit_card_expiration_month": "1",
+    "credit_card_expiration_year": "2039",
+    "credit_card_cvv": "672",
+}
+
+
 def _generate_frontend_traffic(node_port, duration, stop_event):
-    """Best-effort background traffic generator: repeatedly hits the frontend's
-    NodePort so tap has something to observe without the user manually clicking
-    through the app. Assumes the NodePort is reachable at localhost, i.e. that
-    KTMGuard is running on a cluster node; silently gives up on request errors
-    since this is auxiliary, not required for tap itself to work."""
-    url = f"http://localhost:{node_port}/"
+    """Best-effort background traffic generator: repeatedly drives a full
+    browse -> add-to-cart -> checkout flow against the frontend's NodePort so
+    tap/metrics have something to observe without the user manually clicking
+    through the app. A bare GET / only exercises frontend's own fan-out
+    (productcatalog, currency, recommendation, cart-read) - it never calls
+    checkoutservice.PlaceOrder, so checkoutservice->paymentservice and
+    checkoutservice->cartservice are invisible unless checkout is actually
+    submitted. Uses one requests.Session so the cart-session cookie survives
+    across the add-to-cart and checkout calls. Assumes the NodePort is
+    reachable at localhost, i.e. that KTMGuard is running on a cluster node;
+    silently gives up on request errors since this is auxiliary, not required
+    for tap itself to work."""
+    base = f"http://localhost:{node_port}"
     end_time = time.time() + duration
     while time.time() < end_time and not stop_event.is_set():
         try:
-            requests.get(url, timeout=2)
+            session = requests.Session()
+            session.get(f"{base}/", timeout=2)
+            session.post(
+                f"{base}/cart",
+                data={"product_id": CHECKOUT_PRODUCT_ID, "quantity": "1"},
+                timeout=2,
+            )
+            session.post(f"{base}/cart/checkout", data=CHECKOUT_FORM_DATA, timeout=2)
         except requests.exceptions.RequestException:
             pass
         stop_event.wait(1)
@@ -337,7 +391,16 @@ def run_linkerd_tap(namespace, duration, known_names, node_port=None):
     """Runs `linkerd viz tap deploy -n <namespace> --output json` for `duration`
     seconds and decodes each JSON tap event's source/destination deployment
     into a src -> dst edge. Returns (edges, warning); on any failure to start
-    or find the CLI, returns ([], warning) so the caller can skip gracefully."""
+    or find the CLI, returns ([], warning) so the caller can skip gracefully.
+
+    Structural limitation: Linkerd's tap event stream is HTTP request/response
+    events only - a proxy emits a tap event by observing the HTTP layer it
+    parses traffic into. For opaque, non-HTTP ports (e.g. redis-cart:6379,
+    raw RESP protocol) the proxy never parses an HTTP layer, so it never
+    produces a tap event for that connection at all - not a missing label,
+    nothing to observe. Edges on opaque ports can only be recovered from
+    TCP-level Prometheus metrics (see detect_communication_paths), never
+    from tap, regardless of how much traffic is generated."""
     if not _linkerd_cli_available():
         return [], "linkerd CLI not found on PATH; skipping tap-based detection."
 
@@ -419,6 +482,27 @@ def cmd_scan(args):
 
     known_names = {s["name"] for s in services}
 
+    mesh_statuses = check_service_mesh_status(v1, args.namespace, services)
+    print("Mesh injection status:")
+    for s in mesh_statuses:
+        if not s["found"]:
+            print(f"  {s['name']:<22}no running pod found")
+        elif s["meshed"]:
+            print(f"  {s['name']:<22}meshed ({s['ready']}/{s['total']})")
+        else:
+            print(f"  {s['name']:<22}" + yellow(f"NOT MESHED ({s['ready']}/{s['total']})"))
+    print()
+    unmeshed = [s["name"] for s in mesh_statuses if s["found"] and not s["meshed"]]
+    if unmeshed:
+        print(yellow(
+            f"Warning: {', '.join(unmeshed)} have no linkerd-proxy sidecar. "
+            "Traffic to/from these services has no mTLS identity or proxy "
+            "metrics and will never appear as a detected edge, regardless of "
+            "how much traffic is generated. Annotate for injection and run "
+            "'kubectl rollout restart deploy/<name>', then re-scan."
+        ))
+        print()
+
     tap_edges = []
     if args.tap:
         if not _linkerd_cli_available():
@@ -475,8 +559,8 @@ def cmd_scan(args):
         "manual_review_required": manual_review,
     }
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    out_path = os.path.join(OUTPUT_DIR, "service-map.json")
+    os.makedirs(STATE_DIR, exist_ok=True)
+    out_path = os.path.join(STATE_DIR, "service-map.json")
     with open(out_path, "w") as f:
         json.dump(service_map, f, indent=2)
 
@@ -799,11 +883,43 @@ def check_pod_injection(v1, namespace):
     pods = v1.list_namespaced_pod(namespace).items
     total = len(pods)
     fully_ready = 0
+    debug = os.environ.get("KTMGUARD_DEBUG")
     for pod in pods:
         statuses = pod.status.container_statuses or []
+        if debug:
+            print(f"DEBUG: pod={pod.metadata.name} phase={pod.status.phase} "
+                  f"statuses_count={len(statuses)} "
+                  f"names={[c.name for c in statuses]} "
+                  f"ready_states={[c.ready for c in statuses]}")
         if len(statuses) >= 2 and all(c.ready for c in statuses):
             fully_ready += 1
     return fully_ready, total
+
+
+def check_service_mesh_status(v1, namespace, services):
+    """Per-service breakdown of Linkerd sidecar injection. check_pod_injection's
+    aggregate 'N/M pods ready' count hides exactly the failure mode that blocks
+    edge detection: a single unmeshed workload has no linkerd-proxy positioned
+    to report identity/metrics for traffic touching it, so that traffic is
+    invisible to both Prometheus-based detection and `linkerd tap`, no matter
+    how much traffic is generated. Surfacing this per service during `scan`
+    catches that before the user goes looking for a metrics bug that isn't one."""
+    statuses = []
+    for svc in services:
+        pod = find_pod_for_selector(v1, namespace, svc["selector"])
+        if not pod:
+            statuses.append({"name": svc["name"], "found": False, "meshed": False,
+                              "ready": 0, "total": 0})
+            continue
+        container_statuses = pod.status.container_statuses or []
+        statuses.append({
+            "name": svc["name"],
+            "found": True,
+            "meshed": any(c.name == "linkerd-proxy" for c in container_statuses),
+            "ready": sum(1 for c in container_statuses if c.ready),
+            "total": len(container_statuses),
+        })
+    return statuses
 
 
 def check_network_policies(net_v1, namespace):
@@ -947,7 +1063,7 @@ def cmd_verify(args):
     print()
     print("Connectivity verification:")
 
-    map_path = os.path.join(OUTPUT_DIR, "service-map.json")
+    map_path = os.path.join(STATE_DIR, "service-map.json")
     if not os.path.exists(map_path):
         print(yellow(
             "  service-map.json not found; run 'ktmguard scan' first to enable "
@@ -981,8 +1097,8 @@ def cmd_verify(args):
     else:
         print(red("Zero Trust enforcement verification found issues. Review the output above."))
 
-    os.makedirs(OUTPUT_DIR, exist_ok=True)
-    with open(os.path.join(OUTPUT_DIR, "verify-results.json"), "w") as f:
+    os.makedirs(STATE_DIR, exist_ok=True)
+    with open(os.path.join(STATE_DIR, "verify-results.json"), "w") as f:
         json.dump({
             "namespace": args.namespace,
             "generated_at": datetime.now(timezone.utc).isoformat(),
@@ -1001,8 +1117,8 @@ def cmd_verify(args):
 def cmd_report(args):
     header(f"Generating Zero Trust report for namespace: {args.namespace}")
 
-    map_path = os.path.join(OUTPUT_DIR, "service-map.json")
-    verify_path = os.path.join(OUTPUT_DIR, "verify-results.json")
+    map_path = os.path.join(STATE_DIR, "service-map.json")
+    verify_path = os.path.join(STATE_DIR, "verify-results.json")
 
     service_map = None
     if os.path.exists(map_path):
@@ -1099,7 +1215,7 @@ def build_parser():
 
     p_gen = sub.add_parser("generate", help="Generate Zero Trust YAML configuration")
     p_gen.add_argument("--namespace", required=True)
-    p_gen.add_argument("--input", default=os.path.join(OUTPUT_DIR, "service-map.json"))
+    p_gen.add_argument("--input", default=os.path.join(STATE_DIR, "service-map.json"))
     p_gen.add_argument("--dry-run", action="store_true", help="Print YAML to terminal without writing files")
     p_gen.set_defaults(func=cmd_generate)
 

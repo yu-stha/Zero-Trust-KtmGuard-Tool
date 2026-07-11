@@ -35,13 +35,16 @@ python ktmguard.py scan --namespace boutique --prometheus http://localhost:9090
 
 Connects to the cluster, lists services/deployments in the namespace, queries
 Prometheus for observed traffic, and writes a communication map to
-`ktmguard-output/service-map.json`. If Prometheus is unreachable, KTMGuard
-falls back to listing services only and flags the result for manual review.
+`ktmguard-output/.state/service-map.json`. State files live in `.state/` so
+that `kubectl apply -f ktmguard-output/` (which picks up every `.yaml`/`.json`
+file it finds in the directory) only ever sees the generated Kubernetes
+manifests. If Prometheus is unreachable, KTMGuard falls back to listing
+services only and flags the result for manual review.
 
 ### 2. Generate Zero Trust configuration
 
 ```
-python ktmguard.py generate --namespace boutique --input ktmguard-output/service-map.json
+python ktmguard.py generate --namespace boutique --input ktmguard-output/.state/service-map.json
 ```
 
 Produces, inside `ktmguard-output/`:
