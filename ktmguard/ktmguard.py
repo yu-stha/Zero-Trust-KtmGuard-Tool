@@ -879,13 +879,34 @@ def cmd_generate(args):
 # verify
 # --------------------------------------------------------------------------
 
+def _all_running_container_statuses(pod):
+    """Regular container statuses plus native-sidecar init container statuses.
+    Linkerd's proxy is injected as a native sidecar (a Kubernetes 1.29+
+    feature): an init container with spec.restart_policy == "Always" that
+    keeps running alongside the pod's regular containers. The API reports
+    its live status under status.init_container_statuses, never under
+    status.container_statuses - so a caller that only reads
+    container_statuses undercounts every meshed pod by exactly one
+    container, even though kubectl's own READY column merges both lists
+    and counts it correctly. restart_policy on the *spec* (not any field on
+    the status) is what actually marks a container as a sidecar - a normal,
+    run-to-completion init container has no restart_policy and must not be
+    included here, since its status is reported as not-ready once it exits."""
+    regular = list(pod.status.container_statuses or [])
+    init_specs = pod.spec.init_containers or []
+    sidecar_names = {c.name for c in init_specs if c.restart_policy == "Always"}
+    init_statuses = pod.status.init_container_statuses or []
+    sidecars = [c for c in init_statuses if c.name in sidecar_names]
+    return regular + sidecars
+
+
 def check_pod_injection(v1, namespace):
     pods = v1.list_namespaced_pod(namespace).items
     total = len(pods)
     fully_ready = 0
     debug = os.environ.get("KTMGUARD_DEBUG")
     for pod in pods:
-        statuses = pod.status.container_statuses or []
+        statuses = _all_running_container_statuses(pod)
         if debug:
             print(f"DEBUG: pod={pod.metadata.name} phase={pod.status.phase} "
                   f"statuses_count={len(statuses)} "
@@ -911,7 +932,7 @@ def check_service_mesh_status(v1, namespace, services):
             statuses.append({"name": svc["name"], "found": False, "meshed": False,
                               "ready": 0, "total": 0})
             continue
-        container_statuses = pod.status.container_statuses or []
+        container_statuses = _all_running_container_statuses(pod)
         statuses.append({
             "name": svc["name"],
             "found": True,
