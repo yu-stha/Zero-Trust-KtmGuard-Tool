@@ -977,73 +977,19 @@ def find_pod_for_selector(v1, namespace, selector):
     return pods[0] if pods else None
 
 
-def probe_connection(v1, namespace, pod, dst_host, port, timeout=4):
-    """Attempt to determine whether `pod` can actually reach dst_host:port
-    through Linkerd's Zero Trust enforcement - not just whether the TCP
-    socket opens.
-
-    A bare TCP-connect probe (nc -z, /dev/tcp) is not enough: the
-    destination's own Linkerd proxy always accepts the inbound TCP handshake
-    itself (it's a local listener) whether or not it goes on to forward the
-    connection to the application, so a connect-only probe reports REACHABLE
-    even on a path Zero Trust is actively blocking (confirmed manually:
-    `nc -z` opens instantly against a port `wget` proves is actually
-    enforced-closed - `wget` hangs to its own timeout with no response at
-    all, it isn't rejected quickly).
-
-    The AuthorizationPolicy this tool generates (build_linkerd_auth_policies)
-    is scoped to a `Server` resource, i.e. it authorizes at the mTLS-identity
-    *connection* level, not per HTTP request/route. That has a useful
-    consequence: once a connection is authorized, Linkerd forwards whatever
-    bytes arrive - including a plain HTTP/1.1 request sent to a gRPC-only
-    port (most of these services, other than frontend, speak gRPC/HTTP2, not
-    plain HTTP), which the real backend will typically reject or reset
-    almost immediately as an invalid protocol preface. An unauthorized
-    connection, by contrast, is never forwarded at all, so nothing on the far
-    side ever reacts and the probe just runs out its full timeout. So the
-    response's *content* can't be trusted as a REACHABLE/BLOCKED signal on
-    most of these ports - but *how long the probe takes to get any reaction*
-    can: a fast failure means something on the far side reacted (forwarded =
-    authorized); consuming the entire timeout with nothing happening means it
-    was never forwarded (blocked). Elapsed wall-clock time is measured here
-    from the Python side, around the exec call, specifically to avoid
-    depending on `date` supporting sub-second precision inside whatever
-    minimal shell image the target container happens to have.
-
-    This heuristic rests on Linkerd/gRPC-server behavior that can't be
-    verified without a live cluster - validate it against one already-known-
-    allowed and one already-known-blocked edge before trusting it broadly.
-
-    Returns True if reachable, False if blocked/unreachable, None if the
-    probe itself could not be executed (no exec-capable shell, etc).
-    """
-    probe = (
-        f"if command -v wget >/dev/null 2>&1; then "
-        f"  wget -qO- -T {timeout} http://{dst_host}:{port}/ >/dev/null 2>&1; "
-        f"elif command -v curl >/dev/null 2>&1; then "
-        f"  curl -s -m {timeout} -o /dev/null http://{dst_host}:{port}/ >/dev/null 2>&1; "
-        f"elif command -v nc >/dev/null 2>&1; then "
-        f"  nc -w {timeout} {dst_host} {port} </dev/null >/dev/null 2>&1; "
-        f"elif command -v bash >/dev/null 2>&1; then "
-        f"  bash -c '(exec 3<>/dev/tcp/{dst_host}/{port}) && head -c1 <&3' >/dev/null 2>&1; "
-        f"else echo KTMGUARD_NOTOOL; exit 0; fi; "
-        f"echo KTMGUARD_DONE"
-    )
-    command = ["/bin/sh", "-c", probe]
+def _exec_in_pod(v1, namespace, pod, shell_command, timeout):
     container = None
     if pod.spec.containers:
         non_proxy = [c.name for c in pod.spec.containers if c.name != "linkerd-proxy"]
         container = non_proxy[0] if non_proxy else pod.spec.containers[0].name
-
-    start = time.monotonic()
     try:
-        resp = stream(
+        return stream(
             v1.connect_get_namespaced_pod_exec,
             pod.metadata.name,
             namespace,
             container=container,
-            command=command,
-            stderr=True,
+            command=["/bin/sh", "-c", shell_command],
+            stderr=False,
             stdin=False,
             stdout=True,
             tty=False,
@@ -1051,11 +997,111 @@ def probe_connection(v1, namespace, pod, dst_host, port, timeout=4):
         )
     except Exception:
         return None
-    elapsed = time.monotonic() - start
 
-    if "KTMGUARD_NOTOOL" in resp:
+
+def _fetch_proxy_metrics(v1, namespace, pod, timeout=8):
+    """Fetch a pod's own Linkerd proxy admin metrics (127.0.0.1:4191/metrics).
+    Exec'd from the pod's app container, not linkerd-proxy itself - the proxy
+    image has no shell or HTTP client, but 4191 is reachable from any
+    container in the pod since they share a network namespace. Returns the
+    raw Prometheus exposition text, or None if it couldn't be fetched."""
+    fetch = (
+        "if command -v wget >/dev/null 2>&1; then "
+        "  wget -qO- http://localhost:4191/metrics; "
+        "elif command -v curl >/dev/null 2>&1; then "
+        "  curl -s http://localhost:4191/metrics; "
+        "fi"
+    )
+    return _exec_in_pod(v1, namespace, pod, fetch, timeout)
+
+
+def _sum_authz_metric(metrics_text, metric_name, client_id):
+    """Sum the value of every `metric_name{...}` sample in raw Prometheus
+    exposition text whose label set names this specific caller identity.
+    Returns (total, found) - found is False if the metric/identity combination
+    never appears at all, vs. a genuine zero count."""
+    if not metrics_text:
+        return 0.0, False
+    prefix = metric_name + "{"
+    total = 0.0
+    found = False
+    for line in metrics_text.splitlines():
+        if not line.startswith(prefix) or f'client_id="{client_id}"' not in line:
+            continue
+        try:
+            total += float(line.rsplit(" ", 1)[-1])
+        except ValueError:
+            continue
+        found = True
+    return total, found
+
+
+def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, timeout=4):
+    """Determine whether src_pod can actually reach dst_host:port under
+    Linkerd's Zero Trust enforcement, by reading the destination proxy's own
+    authorization decision - not by inferring it from probe side effects.
+
+    Two prior approaches were tried and empirically disproven on this exact
+    cluster before landing here:
+    - A bare TCP-connect probe always reports reachable: the destination's
+      own proxy accepts the inbound handshake itself regardless of whether
+      it goes on to forward anything.
+    - An elapsed-time heuristic (fast failure = forwarded, full timeout =
+      blocked) assumed a real gRPC backend would fast-reject a malformed
+      non-HTTP/2 probe. It doesn't: grpc-go simply never completes the read,
+      so an authorized-but-malformed request and a genuinely blocked one both
+      hang for the full timeout, identically. Confirmed manually: `wget`
+      against checkoutservice -> cartservice (an ALLOWED path) times out with
+      the exact same symptom as frontend -> paymentservice (a BLOCKED path).
+
+    What actually works: build_linkerd_auth_policies scopes each
+    AuthorizationPolicy to a Server resource, i.e. Linkerd decides allow/deny
+    once per connection (by mTLS client identity), not per HTTP request - and
+    it counts that decision itself, in inbound_http_authz_allow_total /
+    inbound_http_authz_deny_total on the destination pod's own proxy, labeled
+    by client_id (confirmed against this cluster's live metrics - see
+    conversation history for the exact label set). So: read that counter for
+    this specific caller identity, trigger one connection attempt (its
+    payload no longer matters, since the decision doesn't depend on it being
+    valid HTTP), read the counter again, and see which side moved.
+
+    Returns True if reachable, False if blocked, None if the decision
+    couldn't be determined (metrics unreadable, or neither counter moved -
+    e.g. the source pod isn't meshed, or the connection never reached the
+    destination proxy's policy check at all).
+    """
+    client_id = f"{src_name}.{namespace}.serviceaccount.identity.linkerd.cluster.local"
+
+    before = _fetch_proxy_metrics(v1, namespace, dst_pod)
+    if before is None:
         return None
-    return elapsed < (timeout * 0.7)
+
+    trigger = (
+        f"if command -v wget >/dev/null 2>&1; then wget -qO- -T {timeout} "
+        f"http://{dst_host}:{port}/ >/dev/null 2>&1; "
+        f"elif command -v nc >/dev/null 2>&1; then nc -w {timeout} {dst_host} {port} "
+        f"</dev/null >/dev/null 2>&1; fi"
+    )
+    if _exec_in_pod(v1, namespace, src_pod, trigger, timeout) is None:
+        return None
+
+    after = _fetch_proxy_metrics(v1, namespace, dst_pod)
+    if after is None:
+        return None
+
+    deny_before, deny_found_b = _sum_authz_metric(before, "inbound_http_authz_deny_total", client_id)
+    deny_after, deny_found_a = _sum_authz_metric(after, "inbound_http_authz_deny_total", client_id)
+    allow_before, allow_found_b = _sum_authz_metric(before, "inbound_http_authz_allow_total", client_id)
+    allow_after, allow_found_a = _sum_authz_metric(after, "inbound_http_authz_allow_total", client_id)
+
+    deny_delta = deny_after - deny_before if (deny_found_a or deny_found_b) else 0
+    allow_delta = allow_after - allow_before if (allow_found_a or allow_found_b) else 0
+
+    if deny_delta > 0:
+        return False
+    if allow_delta > 0:
+        return True
+    return None
 
 
 def run_connectivity_tests(v1, namespace, service_map):
@@ -1080,15 +1126,16 @@ def run_connectivity_tests(v1, namespace, service_map):
         ports = dst_svc.get("ports") or [{"port": 80}]
         port = ports[0]["port"]
 
-        pod = find_pod_for_selector(v1, namespace, services.get(src, {}).get("selector"))
-        if pod is None:
+        src_pod = find_pod_for_selector(v1, namespace, services.get(src, {}).get("selector"))
+        dst_pod = find_pod_for_selector(v1, namespace, services.get(dst, {}).get("selector"))
+        if src_pod is None or dst_pod is None:
             results.append({
                 "src": src, "dst": dst, "port": port,
                 "reachable": None, "expected_blocked": expected_blocked,
             })
             continue
 
-        reachable = probe_connection(v1, namespace, pod, dst, port)
+        reachable = probe_connection(v1, namespace, src_pod, dst_pod, src, dst, port)
         results.append({
             "src": src, "dst": dst, "port": port,
             "reachable": reachable, "expected_blocked": expected_blocked,
