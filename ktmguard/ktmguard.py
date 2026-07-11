@@ -1007,9 +1007,9 @@ def _fetch_proxy_metrics(v1, namespace, pod, timeout=8):
     raw Prometheus exposition text, or None if it couldn't be fetched."""
     fetch = (
         "if command -v wget >/dev/null 2>&1; then "
-        "  wget -qO- http://localhost:4191/metrics; "
+        "  wget -qO- http://127.0.0.1:4191/metrics; "
         "elif command -v curl >/dev/null 2>&1; then "
-        "  curl -s http://localhost:4191/metrics; "
+        "  curl -s http://127.0.0.1:4191/metrics; "
         "fi"
     )
     return _exec_in_pod(v1, namespace, pod, fetch, timeout)
