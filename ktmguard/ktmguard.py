@@ -999,96 +999,51 @@ def _exec_in_pod(v1, namespace, pod, shell_command, timeout):
         return None
 
 
-def _fetch_proxy_metrics(v1, namespace, pod, timeout=8):
-    """Fetch a pod's own Linkerd proxy admin metrics (127.0.0.1:4191/metrics).
-    Exec'd from the pod's app container, not linkerd-proxy itself - the proxy
-    image has no shell or HTTP client, but 4191 is reachable from any
-    container in the pod since they share a network namespace. Returns the
-    raw Prometheus exposition text, or None if it couldn't be fetched."""
-    fetch = (
-        "if command -v wget >/dev/null 2>&1; then "
-        "  wget -qO- http://127.0.0.1:4191/metrics; "
-        "elif command -v curl >/dev/null 2>&1; then "
-        "  curl -s http://127.0.0.1:4191/metrics; "
-        "fi"
-    )
-    return _exec_in_pod(v1, namespace, pod, fetch, timeout)
+def probe_connection(v1, namespace, src_pod, dst_host, port, timeout=4):
+    """Determine whether src_pod can actually reach dst_host:port, by reading
+    the SOURCE pod's own Linkerd outbound proxy log for a connect failure -
+    not by inferring it from probe side effects or destination-side metrics.
 
-
-def _sum_authz_metric(metrics_text, metric_name, client_id):
-    """Sum the value of every `metric_name{...}` sample in raw Prometheus
-    exposition text whose label set names this specific caller identity.
-    Returns (total, found) - found is False if the metric/identity combination
-    never appears at all, vs. a genuine zero count."""
-    if not metrics_text:
-        return 0.0, False
-    prefix = metric_name + "{"
-    total = 0.0
-    found = False
-    for line in metrics_text.splitlines():
-        if not line.startswith(prefix) or f'client_id="{client_id}"' not in line:
-            continue
-        try:
-            total += float(line.rsplit(" ", 1)[-1])
-        except ValueError:
-            continue
-        found = True
-    return total, found
-
-
-def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, timeout=4):
-    """Determine whether src_pod can actually reach dst_host:port under
-    Linkerd's Zero Trust enforcement, by reading the destination proxy's own
-    authorization decision - not by inferring it from probe side effects.
-
-    Two prior approaches were tried and empirically disproven on this exact
+    Three prior approaches were tried and empirically disproven on this exact
     cluster before landing here:
     - A bare TCP-connect probe (nc -z, or any zero-data connect) always
-      reports reachable, but not for the reason it first appeared to: it
-      never actually tests the path to the destination at all. Linkerd
-      transparently redirects a meshed pod's outbound connections to its own
-      local proxy first; nc -z gets an instant local accept from that proxy
-      and exits before the proxy has even started dialing the real backend
-      endpoint. It was always measuring "is my own local proxy running",
-      never "can I reach the destination."
+      reports reachable, but never actually tests the path to the
+      destination: Linkerd transparently redirects a meshed pod's outbound
+      connections to its own local proxy first, which accepts instantly and
+      only *afterwards* dials the real backend - nc -z exits before that
+      dial even starts.
     - An elapsed-time heuristic (fast failure = forwarded, full timeout =
       blocked) assumed a real gRPC backend would fast-reject a malformed
       non-HTTP/2 probe. It doesn't: grpc-go simply never completes the read,
       so an authorized-but-malformed request and a genuinely blocked one both
-      hang for the full timeout, identically. Confirmed manually: `wget`
-      against checkoutservice -> cartservice (an ALLOWED path) times out with
-      the exact same symptom as frontend -> paymentservice (a BLOCKED path).
+      hang for the full timeout, identically.
+    - Diffing the destination's inbound_http_authz_allow_total/deny_total
+      assumed Linkerd always classifies this traffic as HTTP/2 through the
+      matching Server resource. It doesn't, at least not reliably here:
+      real, working, high-volume checkoutservice->cartservice traffic
+      (confirmed via tcp_read_bytes_total) showed srv_name="all-unauthenticated"
+      on the TCP-level metrics and produced no inbound_http_authz_* entry at
+      all, allowed or denied - so that counter family isn't a signal this
+      traffic pattern reliably produces, independent of whether the path is
+      actually blocked.
 
-    What actually works, confirmed against this cluster's live proxy logs:
-    a blocked path (whether stopped by a NetworkPolicy that never lets the
-    connection reach the destination pod, or by Linkerd's own
-    AuthorizationPolicy) never produces an authorization record on the
-    destination's own proxy at all - there's nothing for it to record,
-    because the connection never arrived. An allowed path does, because
-    build_linkerd_auth_policies scopes each AuthorizationPolicy to a Server
-    resource: Linkerd decides allow/deny once per connection (by mTLS client
-    identity), not per HTTP request, and counts that decision in
-    inbound_http_authz_allow_total / inbound_http_authz_deny_total on the
-    destination pod's own proxy, labeled by client_id. So: read that counter
-    for this specific caller identity, trigger one connection attempt (its
-    payload doesn't matter - the decision doesn't depend on it being valid
-    HTTP), read the counter again, and see which side moved. This
-    deliberately doesn't try to attribute *which* layer blocked a path
-    (NetworkPolicy vs. AuthorizationPolicy) - verify only needs to know
-    whether it's reachable end-to-end, and "no record on the destination's
-    proxy at all" reliably means it isn't, regardless of which layer is
-    responsible.
+    What actually works, confirmed directly against this cluster's own proxy
+    log output: when the destination is unreachable (by NetworkPolicy or any
+    other cause), the SOURCE pod's own outbound proxy logs the failed dial
+    itself, in plain text - `linkerd_reconnect: Failed to connect
+    error=connect timed out after 1s` - inside a tracing span naming the
+    destination service (`service{ns=... name=<dst> port=<port>}`). This is
+    Linkerd's own first-party statement about what happened to the
+    connection, not an inference from timing or a metric that may or may not
+    get populated for a given protocol/policy combination. So: trigger one
+    connection attempt (payload doesn't matter), then check whether the
+    source's own proxy log recorded a failed dial to this specific
+    destination in that window.
 
-    Returns True if reachable, False if blocked (including the case where
-    neither counter moved - see above), None only if the metrics themselves
-    could not be read (exec/fetch failure, not a connectivity result).
+    Returns True if reachable, False if blocked, None if the probe itself
+    couldn't be executed or the log couldn't be read (not a connectivity
+    result).
     """
-    client_id = f"{src_name}.{namespace}.serviceaccount.identity.linkerd.cluster.local"
-
-    before = _fetch_proxy_metrics(v1, namespace, dst_pod)
-    if before is None:
-        return None
-
     trigger = (
         f"if command -v wget >/dev/null 2>&1; then wget -qO- -T {timeout} "
         f"http://{dst_host}:{port}/ >/dev/null 2>&1; "
@@ -1098,27 +1053,20 @@ def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, 
     if _exec_in_pod(v1, namespace, src_pod, trigger, timeout) is None:
         return None
 
-    after = _fetch_proxy_metrics(v1, namespace, dst_pod)
-    if after is None:
+    try:
+        log_text = v1.read_namespaced_pod_log(
+            name=src_pod.metadata.name,
+            namespace=namespace,
+            container="linkerd-proxy",
+            since_seconds=timeout + 5,
+        )
+    except ApiException:
         return None
 
-    deny_before, deny_found_b = _sum_authz_metric(before, "inbound_http_authz_deny_total", client_id)
-    deny_after, deny_found_a = _sum_authz_metric(after, "inbound_http_authz_deny_total", client_id)
-    allow_before, allow_found_b = _sum_authz_metric(before, "inbound_http_authz_allow_total", client_id)
-    allow_after, allow_found_a = _sum_authz_metric(after, "inbound_http_authz_allow_total", client_id)
-
-    deny_delta = deny_after - deny_before if (deny_found_a or deny_found_b) else 0
-    allow_delta = allow_after - allow_before if (allow_found_a or allow_found_b) else 0
-
-    if deny_delta > 0:
-        return False
-    if allow_delta > 0:
-        return True
-    # Neither counter moved: the connection never reached a point in the
-    # destination's proxy where it could be authorized, at all - i.e. it
-    # never arrived. That's what a blocked path looks like from here,
-    # regardless of which enforcement layer stopped it.
-    return False
+    for line in log_text.splitlines():
+        if "Failed to connect" in line and f"name={dst_host}" in line:
+            return False
+    return True
 
 
 def run_connectivity_tests(v1, namespace, service_map):
@@ -1144,15 +1092,14 @@ def run_connectivity_tests(v1, namespace, service_map):
         port = ports[0]["port"]
 
         src_pod = find_pod_for_selector(v1, namespace, services.get(src, {}).get("selector"))
-        dst_pod = find_pod_for_selector(v1, namespace, services.get(dst, {}).get("selector"))
-        if src_pod is None or dst_pod is None:
+        if src_pod is None:
             results.append({
                 "src": src, "dst": dst, "port": port,
                 "reachable": None, "expected_blocked": expected_blocked,
             })
             continue
 
-        reachable = probe_connection(v1, namespace, src_pod, dst_pod, src, dst, port)
+        reachable = probe_connection(v1, namespace, src_pod, dst, port)
         results.append({
             "src": src, "dst": dst, "port": port,
             "reachable": reachable, "expected_blocked": expected_blocked,
