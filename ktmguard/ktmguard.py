@@ -1043,9 +1043,14 @@ def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, 
 
     Two prior approaches were tried and empirically disproven on this exact
     cluster before landing here:
-    - A bare TCP-connect probe always reports reachable: the destination's
-      own proxy accepts the inbound handshake itself regardless of whether
-      it goes on to forward anything.
+    - A bare TCP-connect probe (nc -z, or any zero-data connect) always
+      reports reachable, but not for the reason it first appeared to: it
+      never actually tests the path to the destination at all. Linkerd
+      transparently redirects a meshed pod's outbound connections to its own
+      local proxy first; nc -z gets an instant local accept from that proxy
+      and exits before the proxy has even started dialing the real backend
+      endpoint. It was always measuring "is my own local proxy running",
+      never "can I reach the destination."
     - An elapsed-time heuristic (fast failure = forwarded, full timeout =
       blocked) assumed a real gRPC backend would fast-reject a malformed
       non-HTTP/2 probe. It doesn't: grpc-go simply never completes the read,
@@ -1054,21 +1059,29 @@ def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, 
       against checkoutservice -> cartservice (an ALLOWED path) times out with
       the exact same symptom as frontend -> paymentservice (a BLOCKED path).
 
-    What actually works: build_linkerd_auth_policies scopes each
-    AuthorizationPolicy to a Server resource, i.e. Linkerd decides allow/deny
-    once per connection (by mTLS client identity), not per HTTP request - and
-    it counts that decision itself, in inbound_http_authz_allow_total /
-    inbound_http_authz_deny_total on the destination pod's own proxy, labeled
-    by client_id (confirmed against this cluster's live metrics - see
-    conversation history for the exact label set). So: read that counter for
-    this specific caller identity, trigger one connection attempt (its
-    payload no longer matters, since the decision doesn't depend on it being
-    valid HTTP), read the counter again, and see which side moved.
+    What actually works, confirmed against this cluster's live proxy logs:
+    a blocked path (whether stopped by a NetworkPolicy that never lets the
+    connection reach the destination pod, or by Linkerd's own
+    AuthorizationPolicy) never produces an authorization record on the
+    destination's own proxy at all - there's nothing for it to record,
+    because the connection never arrived. An allowed path does, because
+    build_linkerd_auth_policies scopes each AuthorizationPolicy to a Server
+    resource: Linkerd decides allow/deny once per connection (by mTLS client
+    identity), not per HTTP request, and counts that decision in
+    inbound_http_authz_allow_total / inbound_http_authz_deny_total on the
+    destination pod's own proxy, labeled by client_id. So: read that counter
+    for this specific caller identity, trigger one connection attempt (its
+    payload doesn't matter - the decision doesn't depend on it being valid
+    HTTP), read the counter again, and see which side moved. This
+    deliberately doesn't try to attribute *which* layer blocked a path
+    (NetworkPolicy vs. AuthorizationPolicy) - verify only needs to know
+    whether it's reachable end-to-end, and "no record on the destination's
+    proxy at all" reliably means it isn't, regardless of which layer is
+    responsible.
 
-    Returns True if reachable, False if blocked, None if the decision
-    couldn't be determined (metrics unreadable, or neither counter moved -
-    e.g. the source pod isn't meshed, or the connection never reached the
-    destination proxy's policy check at all).
+    Returns True if reachable, False if blocked (including the case where
+    neither counter moved - see above), None only if the metrics themselves
+    could not be read (exec/fetch failure, not a connectivity result).
     """
     client_id = f"{src_name}.{namespace}.serviceaccount.identity.linkerd.cluster.local"
 
@@ -1101,7 +1114,11 @@ def probe_connection(v1, namespace, src_pod, dst_pod, src_name, dst_host, port, 
         return False
     if allow_delta > 0:
         return True
-    return None
+    # Neither counter moved: the connection never reached a point in the
+    # destination's proxy where it could be authorized, at all - i.e. it
+    # never arrived. That's what a blocked path looks like from here,
+    # regardless of which enforcement layer stopped it.
+    return False
 
 
 def run_connectivity_tests(v1, namespace, service_map):
