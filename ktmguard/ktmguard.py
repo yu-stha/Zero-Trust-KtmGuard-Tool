@@ -977,27 +977,65 @@ def find_pod_for_selector(v1, namespace, selector):
     return pods[0] if pods else None
 
 
-def probe_connection(v1, namespace, pod, dst_host, port, timeout=3):
-    """Attempt a TCP connection from inside `pod` to dst_host:port.
+def probe_connection(v1, namespace, pod, dst_host, port, timeout=4):
+    """Attempt to determine whether `pod` can actually reach dst_host:port
+    through Linkerd's Zero Trust enforcement - not just whether the TCP
+    socket opens.
+
+    A bare TCP-connect probe (nc -z, /dev/tcp) is not enough: the
+    destination's own Linkerd proxy always accepts the inbound TCP handshake
+    itself (it's a local listener) whether or not it goes on to forward the
+    connection to the application, so a connect-only probe reports REACHABLE
+    even on a path Zero Trust is actively blocking (confirmed manually:
+    `nc -z` opens instantly against a port `wget` proves is actually
+    enforced-closed - `wget` hangs to its own timeout with no response at
+    all, it isn't rejected quickly).
+
+    The AuthorizationPolicy this tool generates (build_linkerd_auth_policies)
+    is scoped to a `Server` resource, i.e. it authorizes at the mTLS-identity
+    *connection* level, not per HTTP request/route. That has a useful
+    consequence: once a connection is authorized, Linkerd forwards whatever
+    bytes arrive - including a plain HTTP/1.1 request sent to a gRPC-only
+    port (most of these services, other than frontend, speak gRPC/HTTP2, not
+    plain HTTP), which the real backend will typically reject or reset
+    almost immediately as an invalid protocol preface. An unauthorized
+    connection, by contrast, is never forwarded at all, so nothing on the far
+    side ever reacts and the probe just runs out its full timeout. So the
+    response's *content* can't be trusted as a REACHABLE/BLOCKED signal on
+    most of these ports - but *how long the probe takes to get any reaction*
+    can: a fast failure means something on the far side reacted (forwarded =
+    authorized); consuming the entire timeout with nothing happening means it
+    was never forwarded (blocked). Elapsed wall-clock time is measured here
+    from the Python side, around the exec call, specifically to avoid
+    depending on `date` supporting sub-second precision inside whatever
+    minimal shell image the target container happens to have.
+
+    This heuristic rests on Linkerd/gRPC-server behavior that can't be
+    verified without a live cluster - validate it against one already-known-
+    allowed and one already-known-blocked edge before trusting it broadly.
 
     Returns True if reachable, False if blocked/unreachable, None if the
     probe itself could not be executed (no exec-capable shell, etc).
     """
     probe = (
-        f"if command -v nc >/dev/null 2>&1; then "
-        f"  nc -z -w {timeout} {dst_host} {port} && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
-        f"elif command -v bash >/dev/null 2>&1; then "
-        f"  bash -c '(exec 3<>/dev/tcp/{dst_host}/{port})' 2>/dev/null && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
+        f"if command -v wget >/dev/null 2>&1; then "
+        f"  wget -qO- -T {timeout} http://{dst_host}:{port}/ >/dev/null 2>&1; "
         f"elif command -v curl >/dev/null 2>&1; then "
-        f"  curl -s -m {timeout} -o /dev/null {dst_host}:{port} ; "
-        f"  [ $? -ne 7 ] && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
-        f"else echo KTMGUARD_NOTOOL; fi"
+        f"  curl -s -m {timeout} -o /dev/null http://{dst_host}:{port}/ >/dev/null 2>&1; "
+        f"elif command -v nc >/dev/null 2>&1; then "
+        f"  nc -w {timeout} {dst_host} {port} </dev/null >/dev/null 2>&1; "
+        f"elif command -v bash >/dev/null 2>&1; then "
+        f"  bash -c '(exec 3<>/dev/tcp/{dst_host}/{port}) && head -c1 <&3' >/dev/null 2>&1; "
+        f"else echo KTMGUARD_NOTOOL; exit 0; fi; "
+        f"echo KTMGUARD_DONE"
     )
     command = ["/bin/sh", "-c", probe]
     container = None
     if pod.spec.containers:
         non_proxy = [c.name for c in pod.spec.containers if c.name != "linkerd-proxy"]
         container = non_proxy[0] if non_proxy else pod.spec.containers[0].name
+
+    start = time.monotonic()
     try:
         resp = stream(
             v1.connect_get_namespaced_pod_exec,
@@ -1013,12 +1051,11 @@ def probe_connection(v1, namespace, pod, dst_host, port, timeout=3):
         )
     except Exception:
         return None
+    elapsed = time.monotonic() - start
 
-    if "KTMGUARD_OPEN" in resp:
-        return True
-    if "KTMGUARD_CLOSED" in resp:
-        return False
-    return None
+    if "KTMGUARD_NOTOOL" in resp:
+        return None
+    return elapsed < (timeout * 0.7)
 
 
 def run_connectivity_tests(v1, namespace, service_map):
