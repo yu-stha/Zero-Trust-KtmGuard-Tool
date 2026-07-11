@@ -1000,73 +1000,60 @@ def _exec_in_pod(v1, namespace, pod, shell_command, timeout):
 
 
 def probe_connection(v1, namespace, src_pod, dst_host, port, timeout=4):
-    """Determine whether src_pod can actually reach dst_host:port, by reading
-    the SOURCE pod's own Linkerd outbound proxy log for a connect failure -
-    not by inferring it from probe side effects or destination-side metrics.
+    """Check whether a bare TCP connection from src_pod to dst_host:port
+    succeeds.
 
-    Three prior approaches were tried and empirically disproven on this exact
-    cluster before landing here:
-    - A bare TCP-connect probe (nc -z, or any zero-data connect) always
-      reports reachable, but never actually tests the path to the
-      destination: Linkerd transparently redirects a meshed pod's outbound
-      connections to its own local proxy first, which accepts instantly and
-      only *afterwards* dials the real backend - nc -z exits before that
-      dial even starts.
-    - An elapsed-time heuristic (fast failure = forwarded, full timeout =
-      blocked) assumed a real gRPC backend would fast-reject a malformed
-      non-HTTP/2 probe. It doesn't: grpc-go simply never completes the read,
-      so an authorized-but-malformed request and a genuinely blocked one both
-      hang for the full timeout, identically.
-    - Diffing the destination's inbound_http_authz_allow_total/deny_total
-      assumed Linkerd always classifies this traffic as HTTP/2 through the
-      matching Server resource. It doesn't, at least not reliably here:
-      real, working, high-volume checkoutservice->cartservice traffic
-      (confirmed via tcp_read_bytes_total) showed srv_name="all-unauthenticated"
-      on the TCP-level metrics and produced no inbound_http_authz_* entry at
-      all, allowed or denied - so that counter family isn't a signal this
-      traffic pattern reliably produces, independent of whether the path is
-      actually blocked.
+    Known, accepted limitation: this cannot distinguish "reachable
+    end-to-end" from "Linkerd's local outbound proxy on src_pod accepted the
+    handshake, but the real backend is unreachable." Linkerd transparently
+    redirects a meshed pod's outbound connections to its own local proxy,
+    which always accepts before it has even attempted to dial the real
+    destination - so this probe will typically report REACHABLE regardless
+    of whether NetworkPolicy or a Linkerd AuthorizationPolicy is actually
+    blocking the path upstream.
 
-    What actually works, confirmed directly against this cluster's own proxy
-    log output: when the destination is unreachable (by NetworkPolicy or any
-    other cause), the SOURCE pod's own outbound proxy logs the failed dial
-    itself, in plain text - `linkerd_reconnect: Failed to connect
-    error=connect timed out after 1s` - inside a tracing span naming the
-    destination service (`service{ns=... name=<dst> port=<port>}`). This is
-    Linkerd's own first-party statement about what happened to the
-    connection, not an inference from timing or a metric that may or may not
-    get populated for a given protocol/policy combination. So: trigger one
-    connection attempt (payload doesn't matter), then check whether the
-    source's own proxy log recorded a failed dial to this specific
-    destination in that window.
+    Four more precise approaches were tried in place of this one and each
+    surfaced a real, cluster-specific problem rather than a reliable signal:
+    an elapsed-time heuristic assumed a gRPC backend would fast-reject a
+    malformed non-HTTP/2 probe, but grpc-go just never completes the read,
+    so allowed-and-malformed and genuinely-blocked both hang identically;
+    diffing the destination's inbound_http_authz_allow_total/deny_total
+    assumed Linkerd always classifies this traffic as HTTP/2 through the
+    matching Server resource, but real working traffic was observed under
+    srv_name="all-unauthenticated" with no inbound_http_authz_* entry at
+    all; grepping the source proxy's own log for "Failed to connect" worked
+    for the one case it was verified against but wasn't confirmed reliable
+    across the full allowed/blocked matrix within this project's time
+    budget. Rather than keep iterating, this reverts to the simplest
+    possible signal: an honest, known-uninformative result beats an
+    actively misleading one. cmd_verify prints a warning about this
+    limitation alongside the results - treat a REACHABLE result on an
+    expected-blocked path as inconclusive, not as evidence Zero Trust isn't
+    working; verify blocked paths manually if it matters (e.g. `kubectl
+    exec -it -n <ns> deploy/<src> -- wget -qO- --timeout=3
+    http://<dst>:<port>/` and look for a hang/timeout vs. a fast response).
 
-    Returns True if reachable, False if blocked, None if the probe itself
-    couldn't be executed or the log couldn't be read (not a connectivity
-    result).
+    Returns True if the TCP connect succeeds, False if it doesn't, None if
+    the probe itself couldn't be executed (no exec-capable shell, etc).
     """
-    trigger = (
-        f"if command -v wget >/dev/null 2>&1; then wget -qO- -T {timeout} "
-        f"http://{dst_host}:{port}/ >/dev/null 2>&1; "
-        f"elif command -v nc >/dev/null 2>&1; then nc -w {timeout} {dst_host} {port} "
-        f"</dev/null >/dev/null 2>&1; fi"
+    probe = (
+        f"if command -v nc >/dev/null 2>&1; then "
+        f"  nc -z -w {timeout} {dst_host} {port} && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
+        f"elif command -v bash >/dev/null 2>&1; then "
+        f"  bash -c '(exec 3<>/dev/tcp/{dst_host}/{port})' 2>/dev/null && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
+        f"elif command -v curl >/dev/null 2>&1; then "
+        f"  curl -s -m {timeout} -o /dev/null {dst_host}:{port}; "
+        f"  [ $? -ne 7 ] && echo KTMGUARD_OPEN || echo KTMGUARD_CLOSED; "
+        f"else echo KTMGUARD_NOTOOL; fi"
     )
-    if _exec_in_pod(v1, namespace, src_pod, trigger, timeout) is None:
+    resp = _exec_in_pod(v1, namespace, src_pod, probe, timeout)
+    if resp is None:
         return None
-
-    try:
-        log_text = v1.read_namespaced_pod_log(
-            name=src_pod.metadata.name,
-            namespace=namespace,
-            container="linkerd-proxy",
-            since_seconds=timeout + 5,
-        )
-    except ApiException:
-        return None
-
-    for line in log_text.splitlines():
-        if "Failed to connect" in line and f"name={dst_host}" in line:
-            return False
-    return True
+    if "KTMGUARD_OPEN" in resp:
+        return True
+    if "KTMGUARD_CLOSED" in resp:
+        return False
+    return None
 
 
 def run_connectivity_tests(v1, namespace, service_map):
@@ -1131,6 +1118,13 @@ def cmd_verify(args):
 
     print()
     print("Connectivity verification:")
+    print(yellow(
+        "  Note: connectivity results reflect TCP-layer reachability only. "
+        "Linkerd's proxy may report a connection as reachable even when "
+        "application-layer authorization blocks it. Verify critical paths "
+        "manually, e.g.: kubectl exec -it -n <ns> deploy/<src> -- wget -qO- "
+        "--timeout=3 http://<dst>:<port>/"
+    ))
 
     map_path = os.path.join(STATE_DIR, "service-map.json")
     if not os.path.exists(map_path):

@@ -69,9 +69,18 @@ python ktmguard.py generate --namespace boutique --dry-run
 python ktmguard.py verify --namespace boutique
 ```
 
-Checks that pods are meshed (2/2 ready), that NetworkPolicies and Linkerd
-AuthorizationPolicies are applied, and runs a connectivity test to confirm
-disallowed paths are blocked and allowed paths still work.
+Checks that pods are meshed (2/2 ready) and that NetworkPolicies and Linkerd
+AuthorizationPolicies are applied. Also runs a TCP-connect probe between
+service pairs, but note its limit: Linkerd transparently redirects a meshed
+pod's outbound connections to its own local proxy, which accepts the
+connection before attempting to reach the real destination - so this probe
+typically reports every path as reachable regardless of whether
+NetworkPolicy or AuthorizationPolicy is actually blocking it upstream. It
+can't be relied on to confirm a disallowed path is blocked; treat a
+REACHABLE result on a path that should be denied as inconclusive, not as
+evidence enforcement isn't working, and verify important paths manually
+(`kubectl exec -it -n <ns> deploy/<src> -- wget -qO- --timeout=3
+http://<dst>:<port>/` - a genuinely blocked path will hang to the timeout).
 
 ### 4. Generate a report
 
