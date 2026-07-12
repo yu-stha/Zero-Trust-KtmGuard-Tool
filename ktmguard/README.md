@@ -91,6 +91,21 @@ python ktmguard.py report --namespace boutique --output report.md
 Writes a markdown summary of the detected topology and verification results,
 suitable for inclusion in project or thesis documentation.
 
+## Dashboard
+
+A local web UI that wraps the commands above - it does not reimplement any
+KTMGuard logic, it runs the same `ktmguard.py` subcommands as subprocesses
+(and `kubectl apply` for Apply) and renders their output and the JSON/YAML
+files they write to `ktmguard-output/`.
+
+```
+python dashboard.py
+```
+
+Then open [http://127.0.0.1:5000](http://127.0.0.1:5000). It binds to
+127.0.0.1 only and has no authentication - the same trust model as running
+`kubectl`/`ktmguard.py` directly at a terminal on your own machine.
+
 ## Notes
 
 This tool was developed as part of a BSc Cybersecurity thesis on Zero Trust

@@ -1,0 +1,102 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<title>KTMGuard Dashboard</title>
+<link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
+</head>
+<body>
+
+<header class="topbar">
+  <div class="topbar-left">
+    <span class="brand">KTMGuard Dashboard</span>
+  </div>
+  <div class="topbar-right">
+    <label for="namespace">Namespace</label>
+    <input id="namespace" type="text" value="{{ namespace }}" spellcheck="false">
+    <span class="cluster-status">
+      <span id="cluster-dot" class="dot dot-unknown"></span>
+      <span id="cluster-text">checking cluster…</span>
+    </span>
+  </div>
+</header>
+
+<div class="layout">
+  <nav class="sidebar">
+    <button class="nav-btn active" data-action="scan">Scan</button>
+    <button class="nav-btn" data-action="generate">Generate</button>
+    <button class="nav-btn" data-action="apply">Apply</button>
+    <button class="nav-btn" data-action="verify">Verify</button>
+    <button class="nav-btn" data-action="report">Report</button>
+  </nav>
+
+  <main class="main">
+
+    <!-- Scan panel -->
+    <section class="action-panel" id="panel-scan">
+      <h2>Scan</h2>
+      <div class="form-row">
+        <label for="prometheus">Prometheus URL</label>
+        <input id="prometheus" type="text" placeholder="http://localhost:9090">
+      </div>
+      <div class="form-row form-row-inline">
+        <label><input id="tap" type="checkbox"> Use Linkerd tap (--tap)</label>
+        <label for="tap-duration">Tap duration (s)</label>
+        <input id="tap-duration" type="number" value="30" min="1" style="width:5rem">
+      </div>
+      <button class="run-btn" id="run-scan">Run Scan</button>
+      <div class="results" id="scan-results"></div>
+    </section>
+
+    <!-- Generate panel -->
+    <section class="action-panel hidden" id="panel-generate">
+      <h2>Generate</h2>
+      <div class="form-row">
+        <label><input id="dry-run" type="checkbox"> Dry run (--dry-run, prints only, writes no files)</label>
+      </div>
+      <button class="run-btn" id="run-generate">Run Generate</button>
+      <div class="results" id="generate-results"></div>
+    </section>
+
+    <!-- Apply panel -->
+    <section class="action-panel hidden" id="panel-apply">
+      <h2>Apply</h2>
+      <p class="hint">Applies <code>kubectl apply -f ktmguard-output/</code> to the current cluster context.</p>
+      <button class="run-btn run-btn-danger" id="run-apply">Apply to Cluster</button>
+      <div class="results" id="apply-results"></div>
+    </section>
+
+    <!-- Verify panel -->
+    <section class="action-panel hidden" id="panel-verify">
+      <h2>Verify</h2>
+      <button class="run-btn" id="run-verify">Run Verify</button>
+      <div class="results" id="verify-results"></div>
+    </section>
+
+    <!-- Report panel -->
+    <section class="action-panel hidden" id="panel-report">
+      <h2>Report</h2>
+      <button class="run-btn" id="run-report">Run Report</button>
+      <div class="results" id="report-results"></div>
+    </section>
+
+    <h3 class="output-heading">Output</h3>
+    <pre class="terminal" id="terminal"><span class="terminal-placeholder">No command run yet.</span></pre>
+
+  </main>
+</div>
+
+<!-- Apply confirmation modal -->
+<div class="modal-overlay hidden" id="apply-modal">
+  <div class="modal">
+    <p>This will apply Zero Trust policies to your cluster. Continue?</p>
+    <div class="modal-buttons">
+      <button id="apply-cancel" class="btn-secondary">Cancel</button>
+      <button id="apply-confirm" class="btn-danger">Apply</button>
+    </div>
+  </div>
+</div>
+
+<script src="{{ url_for('static', filename='dashboard.js') }}"></script>
+</body>
+</html>
