@@ -5,19 +5,35 @@ This file does not reimplement any KTMGuard scanning/policy-generation/
 verification logic. Every action shells out to `ktmguard.py` (or, for
 Apply, `kubectl apply`) as a subprocess and either streams its raw output
 or reads the same JSON/YAML files ktmguard.py already writes to
-ktmguard-output/. Runs on 127.0.0.1 only - same trust model as running
-kubectl/ktmguard.py directly at a terminal, so there is no authentication.
+ktmguard-output/. A handful of read-only `kubectl get`/`kubectl config
+view` calls are used directly for dashboard-only display purposes
+(cluster address, TLS status, live pod/policy counts for the Overview and
+Apply pages) - these are simple resource listings, not a reimplementation
+of any scan/generate/apply/verify decision logic, which always stays in
+ktmguard.py and is only ever read back from its own output files.
+
+Gated behind a single shared password (see Part 1 below) - the trust
+model is "same as running kubectl/ktmguard.py directly at a terminal,"
+extended with a login step since the dashboard is reachable over the
+network (including from inside a Docker container), not just localhost.
 """
 
+import hmac
 import json
 import os
+import secrets
+import stat
 import subprocess
 import sys
 import threading
 import time
+from datetime import timedelta
 from pathlib import Path
 
-from flask import Flask, Response, jsonify, render_template, request, send_file
+from flask import (
+    Flask, Response, jsonify, redirect, render_template,
+    request, send_file, session, url_for,
+)
 
 try:
     import markdown as markdown_lib
@@ -26,17 +42,31 @@ except ImportError:
     print("Run: pip install -r requirements.txt")
     sys.exit(1)
 
+try:
+    import yaml
+except ImportError:
+    print("Error: the 'PyYAML' package is not installed.")
+    print("Run: pip install -r requirements.txt")
+    sys.exit(1)
+
 BASE_DIR = Path(__file__).resolve().parent
 KTMGUARD_PY = BASE_DIR / "ktmguard.py"
 OUTPUT_DIR = BASE_DIR / "ktmguard-output"
 STATE_DIR = OUTPUT_DIR / ".state"
 REPORT_PATH = OUTPUT_DIR / "report.md"
+PASSWORD_FILE = BASE_DIR / ".dashboard_password"
+SECRET_KEY_FILE = BASE_DIR / ".dashboard_secret_key"
+GENERATED_YAML_FILES = ("deny-all.yaml", "allow-policies.yaml", "linkerd-auth-policy.yaml")
 
 app = Flask(__name__)
+app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(hours=12)
+app.config["SESSION_COOKIE_HTTPONLY"] = True
+app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 
 # In-memory only, by design: the dashboard adds no persistent storage of its
-# own beyond what ktmguard.py already writes to ktmguard-output/. "Defaults
-# to last used" holds for the lifetime of this process, not across restarts.
+# own beyond what ktmguard.py already writes to ktmguard-output/, plus its
+# own auth files below. "Defaults to last used" holds for the lifetime of
+# this process, not across restarts.
 _last_namespace = "boutique"
 
 _lock = threading.Lock()
@@ -48,6 +78,141 @@ _job = {
     "returncode": None,
 }
 
+
+# --------------------------------------------------------------------------
+# Part 1 - Authentication
+# --------------------------------------------------------------------------
+
+def _write_secret_file(path, value):
+    path.write_text(value)
+    try:
+        os.chmod(path, stat.S_IRUSR | stat.S_IWUSR)  # 600; best-effort, e.g. no-op on Windows
+    except OSError:
+        pass
+
+
+def _load_or_create_password():
+    """Precedence: KTMGUARD_DASHBOARD_PASSWORD env var, then the persisted
+    .dashboard_password file, then a freshly generated one. Only the latter
+    two get printed at startup - if the operator set the env var themselves
+    they already know the value."""
+    env_password = os.environ.get("KTMGUARD_DASHBOARD_PASSWORD")
+    if env_password:
+        return env_password, "environment variable", False
+
+    if PASSWORD_FILE.exists():
+        try:
+            existing = PASSWORD_FILE.read_text().strip()
+            if existing:
+                return existing, str(PASSWORD_FILE), True
+        except OSError:
+            pass
+
+    generated = secrets.token_urlsafe(18)
+    _write_secret_file(PASSWORD_FILE, generated)
+    return generated, str(PASSWORD_FILE), True
+
+
+def _load_or_create_secret_key():
+    if SECRET_KEY_FILE.exists():
+        try:
+            existing = SECRET_KEY_FILE.read_text().strip()
+            if existing:
+                return existing
+        except OSError:
+            pass
+    key = secrets.token_hex(32)
+    _write_secret_file(SECRET_KEY_FILE, key)
+    return key
+
+
+_current_password, _password_source, _print_password_at_startup = _load_or_create_password()
+app.secret_key = _load_or_create_secret_key()
+
+# Simple in-memory login-attempt throttle - not persisted, resets on
+# restart. Enough to blunt casual online brute-forcing of the login form
+# without adding a new dependency or any external service.
+_LOGIN_MAX_ATTEMPTS = 5
+_LOGIN_WINDOW_SECONDS = 60
+_login_attempts = {}
+_login_attempts_lock = threading.Lock()
+
+
+def _is_locked_out(ip):
+    now = time.time()
+    with _login_attempts_lock:
+        attempts = [t for t in _login_attempts.get(ip, []) if now - t < _LOGIN_WINDOW_SECONDS]
+        _login_attempts[ip] = attempts
+        return len(attempts) >= _LOGIN_MAX_ATTEMPTS
+
+
+def _record_failed_attempt(ip):
+    with _login_attempts_lock:
+        _login_attempts.setdefault(ip, []).append(time.time())
+
+
+@app.before_request
+def _require_auth():
+    if request.path.startswith("/static/"):
+        return None
+    if request.path == "/login":
+        return None
+    if session.get("authenticated"):
+        return None
+    if request.path.startswith("/api/"):
+        return jsonify({"error": "Unauthorized. Please log in again."}), 401
+    return redirect(url_for("login"))
+
+
+@app.route("/login", methods=["GET", "POST"])
+def login():
+    error = None
+    if request.method == "POST":
+        ip = request.remote_addr or "unknown"
+        if _is_locked_out(ip):
+            error = f"Too many failed attempts. Wait {_LOGIN_WINDOW_SECONDS} seconds and try again."
+        else:
+            submitted = request.form.get("password", "")
+            if hmac.compare_digest(submitted.encode(), _current_password.encode()):
+                session.clear()
+                session["authenticated"] = True
+                session.permanent = True
+                return redirect(url_for("index"))
+            _record_failed_attempt(ip)
+            error = "Incorrect password."
+    return render_template("login.html", error=error)
+
+
+@app.route("/logout", methods=["POST"])
+def logout():
+    session.clear()
+    return redirect(url_for("login"))
+
+
+@app.route("/api/change-password", methods=["POST"])
+def change_password():
+    global _current_password
+    payload = request.get_json(silent=True) or {}
+    current = payload.get("current_password") or ""
+    new_password = (payload.get("new_password") or "").strip()
+
+    if not hmac.compare_digest(current.encode(), _current_password.encode()):
+        return jsonify({"error": "Current password is incorrect."}), 403
+    if len(new_password) < 8:
+        return jsonify({"error": "New password must be at least 8 characters."}), 400
+
+    try:
+        _write_secret_file(PASSWORD_FILE, new_password)
+    except OSError as exc:
+        return jsonify({"error": f"Failed to persist new password: {exc}"}), 500
+
+    _current_password = new_password
+    return jsonify({"ok": True})
+
+
+# --------------------------------------------------------------------------
+# Job runner (unchanged architecture: background thread + SSE stream)
+# --------------------------------------------------------------------------
 
 def _reset_job(action, cmd):
     with _lock:
@@ -122,29 +287,211 @@ def _read_json(path):
 
 
 # --------------------------------------------------------------------------
+# Cluster introspection (dashboard-only display helpers - simple read-only
+# `kubectl` calls, not a reimplementation of ktmguard.py's own logic)
+# --------------------------------------------------------------------------
+
+def _kube_config_view():
+    """Returns (server_address, insecure_skip_tls_verify) for the active
+    kubeconfig context, or (None, False) if it can't be determined."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "config", "view", "--minify", "-o", "json"],
+            capture_output=True, text=True, timeout=5,
+        )
+        if result.returncode != 0:
+            return None, False
+        config = json.loads(result.stdout)
+        clusters = config.get("clusters") or []
+        cluster = clusters[0].get("cluster", {}) if clusters else {}
+        server = cluster.get("server")
+        insecure = bool(cluster.get("insecure-skip-tls-verify", False))
+        return server, insecure
+    except (OSError, subprocess.TimeoutExpired, ValueError, KeyError, IndexError):
+        return None, False
+
+
+def _kubectl_get_json(*args, timeout=8):
+    """Runs `kubectl get ... -o json` and returns the parsed items list, or
+    None if the command failed (missing CRD, no access, cluster down, etc)
+    - callers treat None as "unknown," distinct from an empty-but-successful
+    list."""
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", *args, "-o", "json"],
+            capture_output=True, text=True, timeout=timeout,
+        )
+    except (OSError, subprocess.TimeoutExpired):
+        return None
+    if result.returncode != 0:
+        return None
+    try:
+        return json.loads(result.stdout).get("items", [])
+    except ValueError:
+        return None
+
+
+def _count_generated_resources():
+    counts = {"NetworkPolicy": 0, "AuthorizationPolicy": 0}
+    for name in GENERATED_YAML_FILES:
+        path = OUTPUT_DIR / name
+        if not path.exists():
+            continue
+        try:
+            docs = yaml.safe_load_all(path.read_text())
+            for doc in docs:
+                if not doc:
+                    continue
+                kind = doc.get("kind")
+                if kind in counts:
+                    counts[kind] += 1
+        except yaml.YAMLError:
+            pass
+    return counts
+
+
+def _count_yaml_docs(content):
+    try:
+        return sum(1 for doc in yaml.safe_load_all(content) if doc)
+    except yaml.YAMLError:
+        return 0
+
+
+# --------------------------------------------------------------------------
 # Pages
 # --------------------------------------------------------------------------
 
 @app.route("/")
 def index():
-    return render_template("index.html", namespace=_last_namespace)
+    return render_template(
+        "index.html",
+        namespace=_last_namespace,
+        password_source=_password_source,
+    )
 
 
 # --------------------------------------------------------------------------
-# Cluster status
+# Cluster status (topbar dot, TLS warning strip, Settings page)
 # --------------------------------------------------------------------------
 
-@app.route("/api/cluster-status")
-def cluster_status():
+@app.route("/api/cluster-info")
+def cluster_info():
+    server, insecure = _kube_config_view()
     try:
         result = subprocess.run(
-            ["kubectl", "get", "nodes"],
-            capture_output=True, text=True, timeout=5,
+            ["kubectl", "get", "nodes"], capture_output=True, text=True, timeout=5,
         )
         connected = result.returncode == 0
     except (OSError, subprocess.TimeoutExpired):
         connected = False
-    return jsonify({"connected": connected})
+    return jsonify({
+        "connected": connected,
+        "server": server,
+        "insecure_skip_tls_verify": insecure,
+    })
+
+
+@app.route("/api/test-connection", methods=["POST"])
+def test_connection():
+    try:
+        result = subprocess.run(
+            ["kubectl", "get", "nodes", "-o", "json"],
+            capture_output=True, text=True, timeout=10,
+        )
+    except (OSError, subprocess.TimeoutExpired) as exc:
+        return jsonify({"ok": False, "error": str(exc)})
+    if result.returncode != 0:
+        return jsonify({"ok": False, "error": (result.stderr or "kubectl get nodes failed.").strip()})
+    try:
+        node_count = len(json.loads(result.stdout).get("items", []))
+    except ValueError:
+        node_count = None
+    return jsonify({"ok": True, "node_count": node_count})
+
+
+@app.route("/api/settings")
+def settings_info():
+    server, insecure = _kube_config_view()
+    return jsonify({
+        "server": server,
+        "insecure_skip_tls_verify": insecure,
+        "password_source": _password_source,
+    })
+
+
+# --------------------------------------------------------------------------
+# Overview ("Am I safe?" landing page)
+# --------------------------------------------------------------------------
+
+@app.route("/api/overview")
+def overview():
+    namespace = (request.args.get("namespace") or _last_namespace).strip()
+
+    service_map = _read_json(STATE_DIR / "service-map.json")
+    verify_data = _read_json(STATE_DIR / "verify-results.json")
+
+    services_found = len(service_map.get("services", [])) if service_map else 0
+    edges_detected = len(service_map.get("edges", [])) if service_map else 0
+    last_scan = service_map.get("generated_at") if service_map else None
+
+    # "Protected target" = any service that appears as a destination in the
+    # last scan's edges - that's exactly what `generate` creates a Server /
+    # AuthorizationPolicy trio for. Cross-referencing against the live
+    # AuthorizationPolicy names already applied (each named "<dst>-authz",
+    # per ktmguard.py's build_linkerd_auth_policies) tells us which of those
+    # targets are still unprotected, without recomputing anything - just a
+    # UI-layer diff of two data sources ktmguard.py already produces.
+    protected_targets = sorted({e["dst"] for e in (service_map.get("edges", []) if service_map else [])})
+
+    applied_authz_names = set()
+    authz_items = _kubectl_get_json("authorizationpolicy.policy.linkerd.io", "-n", namespace) if namespace else None
+    if authz_items is not None:
+        for item in authz_items:
+            name = item.get("metadata", {}).get("name", "")
+            if name.endswith("-authz"):
+                applied_authz_names.add(name[: -len("-authz")])
+
+    if authz_items is None:
+        # kubectl itself failed (unreachable cluster, CRD not installed, no
+        # access) - that's "couldn't check," not "confirmed unprotected."
+        # Claiming every target is a gap here would be actively misleading,
+        # so report nothing rather than a false positive; the cluster-status
+        # dot in the topbar is what actually tells the operator why.
+        gaps = []
+    else:
+        gaps = [
+            {"service": dst, "reason": "No AuthorizationPolicy applied yet for this service."}
+            for dst in protected_targets if dst not in applied_authz_names
+        ]
+
+    network_policies = verify_data.get("network_policies") if verify_data else None
+    pod_injection = verify_data.get("pod_injection") if verify_data else None
+    auth_policies = verify_data.get("auth_policies") if verify_data else None
+    overall_ok = verify_data.get("overall_ok") if verify_data else None
+
+    if not network_policies or network_policies.get("count", 0) == 0:
+        status = "not-applied"
+    elif overall_ok:
+        status = "fully-applied"
+    else:
+        status = "partially-applied"
+
+    protected_count = len(applied_authz_names & set(protected_targets)) if protected_targets else 0
+
+    return jsonify({
+        "status": status,
+        "namespace": namespace,
+        "services_found": services_found,
+        "edges_detected": edges_detected,
+        "last_scan": last_scan,
+        "pod_injection": pod_injection,
+        "network_policies": network_policies,
+        "auth_policies": auth_policies,
+        "protected_count": protected_count,
+        "total_targets": len(protected_targets),
+        "gaps": gaps,
+        "gap_check_available": authz_items is not None,
+    })
 
 
 # --------------------------------------------------------------------------
@@ -166,6 +513,8 @@ def run_action(action):
             return jsonify({"error": "Namespace is required."}), 400
         _last_namespace = namespace
         cmd = _ktmguard_cmd("scan", "--namespace", namespace)
+        if payload.get("static"):
+            cmd += ["--static"]
         prometheus = (payload.get("prometheus") or "").strip()
         if prometheus:
             cmd += ["--prometheus", prometheus]
@@ -257,6 +606,9 @@ def scan_result():
         return jsonify({"available": False})
     return jsonify({
         "available": True,
+        "namespace": data.get("namespace"),
+        "generated_at": data.get("generated_at"),
+        "services": [s.get("name") for s in data.get("services", [])],
         "edges": data.get("edges", []),
         "manual_review_required": data.get("manual_review_required", False),
     })
@@ -265,14 +617,85 @@ def scan_result():
 @app.route("/api/generate-result")
 def generate_result():
     files = {}
-    for name in ("deny-all.yaml", "allow-policies.yaml", "linkerd-auth-policy.yaml"):
+    rule_counts = {}
+    for name in GENERATED_YAML_FILES:
         path = OUTPUT_DIR / name
         if path.exists():
             try:
-                files[name] = path.read_text()
+                content = path.read_text()
+                files[name] = content
+                rule_counts[name] = _count_yaml_docs(content)
             except OSError:
                 pass
-    return jsonify({"files": files})
+
+    service_map = _read_json(STATE_DIR / "service-map.json")
+    review_edges = []
+    if service_map:
+        for e in service_map.get("edges", []):
+            if e.get("confidence") in ("unconfirmed", "observed-only"):
+                review_edges.append({
+                    "src": e.get("src"),
+                    "dst": e.get("dst"),
+                    "confidence": e.get("confidence"),
+                })
+
+    return jsonify({"files": files, "rule_counts": rule_counts, "review_edges": review_edges})
+
+
+@app.route("/api/apply-preflight")
+def apply_preflight():
+    namespace = (request.args.get("namespace") or _last_namespace).strip()
+    counts = _count_generated_resources()
+    server, _insecure = _kube_config_view()
+    files_exist = any((OUTPUT_DIR / n).exists() for n in GENERATED_YAML_FILES)
+    return jsonify({
+        "namespace": namespace,
+        "network_policy_count": counts["NetworkPolicy"],
+        "authorization_policy_count": counts["AuthorizationPolicy"],
+        "server": server,
+        "files_exist": files_exist,
+    })
+
+
+@app.route("/api/pod-health")
+def pod_health():
+    namespace = (request.args.get("namespace") or _last_namespace).strip()
+    if not namespace:
+        return jsonify({"error": "Namespace is required."}), 400
+
+    items = _kubectl_get_json("pods", "-n", namespace)
+    if items is None:
+        return jsonify({"error": "Failed to list pods (kubectl get pods failed)."}), 500
+
+    pods = []
+    for item in items:
+        name = item.get("metadata", {}).get("name", "?")
+        spec = item.get("spec", {})
+        status = item.get("status", {})
+        # Native sidecars (Linkerd's proxy included, on Kubernetes 1.29+)
+        # report status under initContainerStatuses, identified by
+        # restartPolicy: Always on the initContainer's own spec - the same
+        # field kubectl's own READY column reads to merge them into the
+        # regular container count.
+        sidecar_names = {
+            c.get("name") for c in (spec.get("initContainers") or [])
+            if c.get("restartPolicy") == "Always"
+        }
+        regular = status.get("containerStatuses") or []
+        init_statuses = status.get("initContainerStatuses") or []
+        sidecars = [c for c in init_statuses if c.get("name") in sidecar_names]
+        statuses = regular + sidecars
+        ready = sum(1 for c in statuses if c.get("ready"))
+        total = len(statuses)
+        phase = status.get("phase", "Unknown")
+        pods.append({
+            "name": name,
+            "ready": ready,
+            "total": total,
+            "phase": phase,
+            "healthy": total > 0 and ready == total and phase == "Running",
+        })
+    return jsonify({"pods": pods})
 
 
 @app.route("/api/verify-result")
@@ -333,4 +756,18 @@ def report_download():
 
 
 if __name__ == "__main__":
-    app.run(host="127.0.0.1", port=5000, threaded=True)
+    if _print_password_at_startup:
+        print("=" * 60)
+        print("KTMGuard Dashboard")
+        print(f"Password ({_password_source}): {_current_password}")
+        print("=" * 60)
+    else:
+        print("KTMGuard Dashboard - password set via KTMGUARD_DASHBOARD_PASSWORD.")
+
+    # Binds to all interfaces by default (needed for Docker's -p mapping to
+    # reach it at all) now that every route is gated behind the password
+    # above. Set KTMGUARD_DASHBOARD_HOST=127.0.0.1 to restrict to localhost
+    # only, e.g. when deliberately relying on an SSH tunnel instead.
+    host = os.environ.get("KTMGUARD_DASHBOARD_HOST", "0.0.0.0")
+    port = int(os.environ.get("KTMGUARD_DASHBOARD_PORT", "5000"))
+    app.run(host=host, port=port, threaded=True)

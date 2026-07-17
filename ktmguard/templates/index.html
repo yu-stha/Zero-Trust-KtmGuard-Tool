@@ -2,86 +2,226 @@
 <html lang="en">
 <head>
 <meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
 <title>KTMGuard Dashboard</title>
 <link rel="stylesheet" href="{{ url_for('static', filename='dashboard.css') }}">
 </head>
 <body>
 
+<div class="tls-warning hidden" id="tls-warning">
+  <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 4 5v6c0 5 3.4 8.6 8 9 4.6-.4 8-4 8-9V5l-8-3Z" stroke-linejoin="round"/><path d="M12 8v5M12 16.5v.01" stroke-linecap="round"/></svg>
+  TLS verification disabled for this cluster connection - confirm this is a test/lab environment
+</div>
+
 <header class="topbar">
   <div class="topbar-left">
-    <span class="brand">KTMGuard Dashboard</span>
+    <span class="brand">
+      <svg class="brand-icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.6"><path d="M12 2 4 5v6c0 5 3.4 8.6 8 9 4.6-.4 8-4 8-9V5l-8-3Z" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      KTMGuard
+    </span>
   </div>
   <div class="topbar-right">
     <label for="namespace">Namespace</label>
     <input id="namespace" type="text" value="{{ namespace }}" spellcheck="false">
-    <span class="cluster-status">
+    <span class="cluster-status" id="cluster-status" title="">
       <span id="cluster-dot" class="dot dot-unknown"></span>
       <span id="cluster-text">checking cluster…</span>
     </span>
+    <form action="{{ url_for('logout') }}" method="post" class="logout-form">
+      <button type="submit" class="icon-btn" title="Log out">
+        <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4" stroke-linecap="round" stroke-linejoin="round"/><path d="M16 17l5-5-5-5M21 12H9" stroke-linecap="round" stroke-linejoin="round"/></svg>
+        Log out
+      </button>
+    </form>
   </div>
 </header>
 
 <div class="layout">
   <nav class="sidebar">
-    <button class="nav-btn active" data-action="scan">Scan</button>
-    <button class="nav-btn" data-action="generate">Generate</button>
-    <button class="nav-btn" data-action="apply">Apply</button>
-    <button class="nav-btn" data-action="verify">Verify</button>
-    <button class="nav-btn" data-action="report">Report</button>
+    <button class="nav-btn active" data-page="overview">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><rect x="3" y="3" width="7" height="7" rx="1"/><rect x="14" y="3" width="7" height="7" rx="1"/><rect x="3" y="14" width="7" height="7" rx="1"/><rect x="14" y="14" width="7" height="7" rx="1"/></svg>
+      Overview
+    </button>
+    <button class="nav-btn" data-page="scan">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="11" cy="11" r="7"/><path d="m21 21-4.3-4.3" stroke-linecap="round"/></svg>
+      Scan
+    </button>
+    <button class="nav-btn" data-page="generate">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke-linejoin="round"/><path d="M14 2v6h6" stroke-linejoin="round"/><path d="m9 15 2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Generate
+    </button>
+    <button class="nav-btn" data-page="apply">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 16V4M7 9l5-5 5 5" stroke-linecap="round" stroke-linejoin="round"/><path d="M4 16v3a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2v-3" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Apply
+    </button>
+    <button class="nav-btn" data-page="verify">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M12 2 4 5v6c0 5 3.4 8.6 8 9 4.6-.4 8-4 8-9V5l-8-3Z" stroke-linejoin="round"/><path d="m9 12 2 2 4-4" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Verify
+    </button>
+    <button class="nav-btn" data-page="report">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z" stroke-linejoin="round"/><path d="M14 2v6h6M8 13h8M8 17h8M8 9h2" stroke-linecap="round"/></svg>
+      Report
+    </button>
+    <button class="nav-btn" data-page="settings">
+      <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8"><circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.7 1.7 0 0 0 .3 1.9l.1.1a2 2 0 1 1-2.8 2.8l-.1-.1a1.7 1.7 0 0 0-1.9-.3 1.7 1.7 0 0 0-1 1.5V21a2 2 0 1 1-4 0v-.1a1.7 1.7 0 0 0-1-1.6 1.7 1.7 0 0 0-1.9.3l-.1.1a2 2 0 1 1-2.8-2.8l.1-.1a1.7 1.7 0 0 0 .3-1.9 1.7 1.7 0 0 0-1.5-1H3a2 2 0 1 1 0-4h.1a1.7 1.7 0 0 0 1.6-1 1.7 1.7 0 0 0-.3-1.9l-.1-.1a2 2 0 1 1 2.8-2.8l.1.1a1.7 1.7 0 0 0 1.9.3H9a1.7 1.7 0 0 0 1-1.5V3a2 2 0 1 1 4 0v.1a1.7 1.7 0 0 0 1 1.5 1.7 1.7 0 0 0 1.9-.3l.1-.1a2 2 0 1 1 2.8 2.8l-.1.1a1.7 1.7 0 0 0-.3 1.9V9a1.7 1.7 0 0 0 1.5 1H21a2 2 0 1 1 0 4h-.1a1.7 1.7 0 0 0-1.5 1Z" stroke-linecap="round" stroke-linejoin="round"/></svg>
+      Settings
+    </button>
   </nav>
 
   <main class="main">
 
-    <!-- Scan panel -->
-    <section class="action-panel" id="panel-scan">
-      <h2>Scan</h2>
-      <div class="form-row">
-        <label for="prometheus">Prometheus URL</label>
-        <input id="prometheus" type="text" placeholder="http://localhost:9090">
+    <!-- ================= Overview ================= -->
+    <section class="page" id="page-overview">
+      <h1 class="page-title">Overview</h1>
+
+      <div class="card status-card" id="overview-status-card">
+        <div class="status-card-badge status-loading" id="overview-status-badge">Checking cluster state…</div>
+        <div class="status-card-sub" id="overview-status-sub"></div>
       </div>
-      <div class="form-row form-row-inline">
-        <label><input id="tap" type="checkbox"> Use Linkerd tap (--tap)</label>
+
+      <div class="summary-strip">
+        <div class="summary-item"><span class="summary-value" id="ov-services">-</span><span class="summary-label">Services found</span></div>
+        <div class="summary-item"><span class="summary-value" id="ov-edges">-</span><span class="summary-label">Edges detected</span></div>
+        <div class="summary-item"><span class="summary-value" id="ov-mesh">-</span><span class="summary-label">Mesh status</span></div>
+        <div class="summary-item"><span class="summary-value" id="ov-lastscan">-</span><span class="summary-label">Last scan</span></div>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">Unprotected Services</h2>
+        <div id="overview-gaps-list"><p class="hint">Loading…</p></div>
+      </div>
+    </section>
+
+    <!-- ================= Scan ================= -->
+    <section class="page hidden" id="page-scan">
+      <h1 class="page-title">Scan</h1>
+
+      <div class="method-cards">
+        <label class="method-card">
+          <input type="checkbox" id="method-static" checked>
+          <div class="method-card-body">
+            <div class="method-card-title">Configuration-based (--static)</div>
+            <div class="method-card-desc">Reads service configuration directly. Works without a service mesh. Best starting point.</div>
+          </div>
+        </label>
+        <label class="method-card">
+          <input type="checkbox" id="method-tap">
+          <div class="method-card-body">
+            <div class="method-card-title">Live traffic tap (--tap)</div>
+            <div class="method-card-desc">Watches real traffic briefly. Requires Linkerd.</div>
+          </div>
+        </label>
+        <label class="method-card">
+          <input type="checkbox" id="method-prometheus">
+          <div class="method-card-body">
+            <div class="method-card-title">Metrics history (--prometheus)</div>
+            <div class="method-card-desc">Reads historical traffic metrics. Requires Linkerd Viz.</div>
+          </div>
+        </label>
+      </div>
+
+      <div class="form-row" id="prometheus-url-row">
+        <label for="prometheus-url">Prometheus URL</label>
+        <input id="prometheus-url" type="text" value="http://localhost:9091" spellcheck="false">
+      </div>
+      <div class="form-row form-row-inline" id="tap-duration-row">
         <label for="tap-duration">Tap duration (s)</label>
         <input id="tap-duration" type="number" value="30" min="1" style="width:5rem">
       </div>
-      <button class="run-btn" id="run-scan">Run Scan</button>
+
+      <button class="btn-primary" id="run-scan">Run Scan</button>
+
+      <h2 class="section-heading">Output</h2>
+      <pre class="terminal" id="terminal-scan"><span class="terminal-placeholder">No command run yet.</span></pre>
+
       <div class="results" id="scan-results"></div>
     </section>
 
-    <!-- Generate panel -->
-    <section class="action-panel hidden" id="panel-generate">
-      <h2>Generate</h2>
-      <div class="form-row">
-        <label><input id="dry-run" type="checkbox"> Dry run (--dry-run, prints only, writes no files)</label>
+    <!-- ================= Generate ================= -->
+    <section class="page hidden" id="page-generate">
+      <h1 class="page-title">Generate</h1>
+
+      <div class="form-row form-row-inline">
+        <label class="toggle-label"><input type="checkbox" id="dry-run" checked> Dry run (preview only, writes no files)</label>
       </div>
-      <button class="run-btn" id="run-generate">Run Generate</button>
+
+      <button class="btn-primary" id="run-generate">Run Generate</button>
+
+      <h2 class="section-heading">Output</h2>
+      <pre class="terminal" id="terminal-generate"><span class="terminal-placeholder">No command run yet.</span></pre>
+
       <div class="results" id="generate-results"></div>
     </section>
 
-    <!-- Apply panel -->
-    <section class="action-panel hidden" id="panel-apply">
-      <h2>Apply</h2>
-      <p class="hint">Applies <code>kubectl apply -f ktmguard-output/</code> to the current cluster context.</p>
-      <button class="run-btn run-btn-danger" id="run-apply">Apply to Cluster</button>
+    <!-- ================= Apply ================= -->
+    <section class="page hidden" id="page-apply">
+      <h1 class="page-title">Apply</h1>
+
+      <div class="card" id="apply-preflight-card">
+        <p id="apply-preflight-text" class="hint">Loading preflight summary…</p>
+      </div>
+
+      <button class="btn-danger" id="run-apply">Apply to Cluster</button>
+
+      <h2 class="section-heading">Output</h2>
+      <pre class="terminal" id="terminal-apply"><span class="terminal-placeholder">No command run yet.</span></pre>
+
       <div class="results" id="apply-results"></div>
     </section>
 
-    <!-- Verify panel -->
-    <section class="action-panel hidden" id="panel-verify">
-      <h2>Verify</h2>
-      <button class="run-btn" id="run-verify">Run Verify</button>
+    <!-- ================= Verify ================= -->
+    <section class="page hidden" id="page-verify">
+      <h1 class="page-title">Verify</h1>
+
+      <button class="btn-primary" id="run-verify">Run Verify</button>
+
+      <h2 class="section-heading">Output</h2>
+      <pre class="terminal" id="terminal-verify"><span class="terminal-placeholder">No command run yet.</span></pre>
+
       <div class="results" id="verify-results"></div>
     </section>
 
-    <!-- Report panel -->
-    <section class="action-panel hidden" id="panel-report">
-      <h2>Report</h2>
-      <button class="run-btn" id="run-report">Run Report</button>
+    <!-- ================= Report ================= -->
+    <section class="page hidden" id="page-report">
+      <h1 class="page-title">Report</h1>
+
+      <button class="btn-primary" id="run-report">Run Report</button>
+
+      <h2 class="section-heading">Output</h2>
+      <pre class="terminal" id="terminal-report"><span class="terminal-placeholder">No command run yet.</span></pre>
+
       <div class="results" id="report-results"></div>
     </section>
 
-    <h3 class="output-heading">Output</h3>
-    <pre class="terminal" id="terminal"><span class="terminal-placeholder">No command run yet.</span></pre>
+    <!-- ================= Settings ================= -->
+    <section class="page hidden" id="page-settings">
+      <h1 class="page-title">Settings</h1>
+
+      <div class="card">
+        <h2 class="card-title">Cluster Connection</h2>
+        <dl class="kv-list">
+          <dt>Server</dt><dd id="settings-server">-</dd>
+          <dt>TLS verification</dt><dd id="settings-tls">-</dd>
+        </dl>
+        <button class="btn-secondary" id="settings-test-connection">Test Connection</button>
+        <p class="hint" id="settings-test-result"></p>
+      </div>
+
+      <div class="card">
+        <h2 class="card-title">Dashboard Password</h2>
+        <p class="hint" id="settings-password-source"></p>
+        <div class="form-row">
+          <label for="settings-current-password">Current password</label>
+          <input type="password" id="settings-current-password" autocomplete="current-password">
+        </div>
+        <div class="form-row">
+          <label for="settings-new-password">New password</label>
+          <input type="password" id="settings-new-password" autocomplete="new-password">
+        </div>
+        <button class="btn-primary" id="settings-change-password">Change Password</button>
+        <p class="hint" id="settings-password-result"></p>
+      </div>
+    </section>
 
   </main>
 </div>
@@ -89,10 +229,12 @@
 <!-- Apply confirmation modal -->
 <div class="modal-overlay hidden" id="apply-modal">
   <div class="modal">
-    <p>This will apply Zero Trust policies to your cluster. Continue?</p>
+    <p>This will apply Zero Trust policies to namespace <strong id="apply-modal-namespace"></strong> on cluster <strong id="apply-modal-server"></strong>.</p>
+    <p class="hint">Type the namespace name to confirm:</p>
+    <input type="text" id="apply-modal-input" class="modal-input" spellcheck="false" autocomplete="off">
     <div class="modal-buttons">
       <button id="apply-cancel" class="btn-secondary">Cancel</button>
-      <button id="apply-confirm" class="btn-danger">Apply</button>
+      <button id="apply-confirm" class="btn-danger" disabled>Apply</button>
     </div>
   </div>
 </div>

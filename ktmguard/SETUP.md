@@ -34,13 +34,26 @@ Every edge `scan` finds is tagged with which method(s) found it:
 
 - A running Kubernetes cluster with Linkerd installed and the target namespace injected (see the lab repository's `SETUP.md`)
 - `kubectl` installed and configured with a working `kubeconfig` pointed at the cluster
-- Python 3.10+
+- Python 3.10+ (Option A) or Docker (Option B) — see below
 
 KTMGuard does **not** need to run on the cluster's own node. It works identically from any machine with `kubectl` access to the cluster — see the "Remote Client Setup" section below.
 
-If you're starting with `--static` detection only (no mesh installed yet), that's all you need — `kubectl` access and Python. The Linkerd CLI and Prometheus port-forward steps below are only required for `--tap`/`--prometheus`.
+If you're starting with `--static` detection only (no mesh installed yet), that's all you need — `kubectl` access and Python (or Docker). The Linkerd CLI and Prometheus port-forward steps below are only required for `--tap`/`--prometheus`.
 
-## Part 1 — Local Installation (Same Machine as the Cluster)
+## Two Ways to Install KTMGuard
+
+| | Option A: git clone | Option B: Docker |
+|---|---|---|
+| Best for | Cluster-adjacent machine, comfortable with Python/CLI setup | Personal laptop, minimal setup desired |
+| Requires | Python 3.10+, pip, kubectl, optionally Linkerd CLI | Docker only |
+| Setup steps | ~8 steps | 2 steps: build/pull image, run with mounted kubeconfig |
+| Updates | `git pull` + reinstall deps | `docker pull` a new image tag (or rebuild) |
+| Runs the CLI (`scan`/`generate`/`verify`/`report`) | Yes, directly | Yes, via `docker exec` into the running container |
+| Runs the web dashboard | Yes (`python3 dashboard.py`) | Yes — this is what the image's default `CMD` runs |
+
+Both options run the exact same `ktmguard.py` and `dashboard.py` — Option B just packages Option A's dependencies (Python, kubectl, the Linkerd CLI) into one image instead of installing them by hand. Pick whichever fits your machine; nothing else in this guide changes based on which you choose.
+
+## Part 1 — Option A: git clone Installation (Same Machine as the Cluster)
 
 ```bash
 git clone https://github.com/yu-stha/Zero-Trust-KtmGuard-Tool.git
@@ -78,6 +91,72 @@ cat /tmp/pf-prom.log
 ```
 
 Confirm it shows `Forwarding from 127.0.0.1:9091 -> 9090` before continuing.
+
+## Part 1B — Option B: Docker Installation
+
+**Read this before you run anything:** the container is designed to run on **the operator's own machine** — a junior engineer's laptop, or any client machine with a working kubeconfig pointed at the target cluster — **not** on the Kubernetes cluster's own infrastructure node. This is the same "runs wherever `kubectl` runs" model as Option A, just containerized.
+
+The container shares its host machine's network access. If the host can already reach the cluster's API server — via its kubeconfig, and whatever security group / firewall rules that requires — the containerized dashboard can too, with no additional network configuration. Nothing needs to be exposed to the cluster's own network; the container only ever makes outbound calls to the API server your kubeconfig already points at.
+
+Your kubeconfig is **mounted**, never baked into the image. Changing which cluster you're pointed at means updating the host's `~/.kube/config` and restarting the container — no image rebuild needed.
+
+### Build and Run
+
+```bash
+git clone https://github.com/yu-stha/Zero-Trust-KtmGuard-Tool.git
+cd Zero-Trust-KtmGuard-Tool/ktmguard
+
+docker build -t ktmguard-dashboard .
+docker run -d --restart=unless-stopped \
+  -v ~/.kube/config:/root/.kube/config:ro \
+  -p 5000:5000 --name ktmguard-dashboard ktmguard-dashboard
+```
+
+That's it — two steps. Then:
+
+```bash
+docker logs ktmguard-dashboard
+```
+
+to read the auto-generated dashboard password (see "Web Dashboard" below), and browse to `http://localhost:5000`.
+
+### Or: docker-compose
+
+```bash
+docker compose up -d --build
+```
+
+Uses the included `docker-compose.yml`, which mounts `~/.kube/config` read-only, maps port 5000, and sets `restart: unless-stopped` — equivalent to the `docker run` command above.
+
+### A Docker-Specific Gotcha: the Password File
+
+`.dashboard_password` (see "Web Dashboard" below) is written inside the container's own filesystem. `restart: unless-stopped` / `docker restart` keep the **same** container, so the password survives normal restarts. But `docker rm` + recreate (or `docker compose down` followed by `up`, depending on your compose version) destroys that filesystem and a fresh random password gets generated next time. For Docker deployments, it's simplest to set the password explicitly rather than rely on the generated one:
+
+```bash
+docker run -d --restart=unless-stopped \
+  -v ~/.kube/config:/root/.kube/config:ro \
+  -e KTMGUARD_DASHBOARD_PASSWORD=your-own-password \
+  -p 5000:5000 --name ktmguard-dashboard ktmguard-dashboard
+```
+
+### Running CLI Commands Inside the Container
+
+The dashboard is the default entrypoint, but the same image can run `ktmguard.py` directly:
+
+```bash
+docker exec -it ktmguard-dashboard python ktmguard.py scan --namespace boutique --static
+```
+
+### Updating
+
+```bash
+git pull
+docker build -t ktmguard-dashboard .
+docker stop ktmguard-dashboard && docker rm ktmguard-dashboard
+docker run -d --restart=unless-stopped -v ~/.kube/config:/root/.kube/config:ro -p 5000:5000 --name ktmguard-dashboard ktmguard-dashboard
+```
+
+(Note the password-file gotcha above applies here too, since this recreates the container.)
 
 ## Part 2 — Remote Client Setup (Separate Machine, No Cluster Components)
 

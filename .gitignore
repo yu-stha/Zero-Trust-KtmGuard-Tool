@@ -4,3 +4,5 @@ __pycache__/
 .venv/
 ktmguard-output/
 CLAUDE_CONTEXT.md/
+ktmguard/.dashboard_password
+ktmguard/.dashboard_secret_key

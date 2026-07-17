@@ -1,0 +1,17 @@
+services:
+  ktmguard-dashboard:
+    build: .
+    image: ktmguard-dashboard
+    container_name: ktmguard-dashboard
+    ports:
+      - "5000:5000"
+    volumes:
+      # Read-only: the dashboard never needs to write to your kubeconfig.
+      - ~/.kube/config:/root/.kube/config:ro
+    # Recommended: set an explicit password for Docker deployments. A
+    # freshly-generated one is written inside the container's own
+    # filesystem and is lost if the container is removed and recreated
+    # (not just restarted) - see SETUP.md.
+    # environment:
+    #   - KTMGUARD_DASHBOARD_PASSWORD=changeme
+    restart: unless-stopped
