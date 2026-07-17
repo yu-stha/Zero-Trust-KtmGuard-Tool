@@ -15,6 +15,7 @@ import subprocess
 import sys
 import threading
 import time
+import urllib.parse
 from datetime import datetime, timezone
 
 import requests
@@ -325,8 +326,25 @@ def detect_communication_paths(prom_url, namespace, services):
 # Linkerd tap-based edge detection (optional, --tap)
 # --------------------------------------------------------------------------
 
+def _linkerd_binary_path():
+    """Resolves the linkerd CLI, checking PATH first and falling back to the
+    default install location (~/.linkerd2/bin/linkerd, per SETUP.md's own
+    install instructions) in case PATH wasn't propagated to whatever
+    process invoked ktmguard.py - e.g. a long-running server process (such
+    as the dashboard) started before a PATH change made via ~/.bashrc,
+    which only takes effect for new interactive shells, not processes
+    already running."""
+    found = shutil.which("linkerd")
+    if found:
+        return found
+    fallback = os.path.expanduser("~/.linkerd2/bin/linkerd")
+    if os.path.isfile(fallback) and os.access(fallback, os.X_OK):
+        return fallback
+    return None
+
+
 def _linkerd_cli_available():
-    return shutil.which("linkerd") is not None
+    return _linkerd_binary_path() is not None
 
 
 def _frontend_node_port(services):
@@ -337,6 +355,25 @@ def _frontend_node_port(services):
             if p.get("node_port"):
                 return p["node_port"]
     return None
+
+
+def _resolve_traffic_target_host():
+    """Host to use for NodePort-based auto traffic generation. Reads the API
+    server host already resolved from the active kubeconfig context, rather
+    than hardcoding 'localhost'. This matters specifically for the
+    remote-client scenario documented in SETUP.md: there, the kubeconfig's
+    server address is already the cluster's reachable public IP (that's how
+    `kubectl`/the K8s API calls work at all from that machine) - and that
+    same address is where the cluster's NodePort services are reachable
+    too, whereas 'localhost' on a remote client reaches nothing. On a
+    cluster node itself this still correctly resolves back to 127.0.0.1.
+    Falls back to 'localhost' if the host can't be determined for any
+    reason, preserving the old behavior rather than failing outright."""
+    try:
+        host = urllib.parse.urlparse(client.Configuration.get_default_copy().host).hostname
+        return host or "localhost"
+    except Exception:
+        return "localhost"
 
 
 # Well-known Online Boutique catalog product id (Sunglasses) - used by the
@@ -357,7 +394,7 @@ CHECKOUT_FORM_DATA = {
 }
 
 
-def _generate_frontend_traffic(node_port, duration, stop_event):
+def _generate_frontend_traffic(target_host, node_port, duration, stop_event):
     """Best-effort background traffic generator: repeatedly drives a full
     browse -> add-to-cart -> checkout flow against the frontend's NodePort so
     tap/metrics have something to observe without the user manually clicking
@@ -366,11 +403,16 @@ def _generate_frontend_traffic(node_port, duration, stop_event):
     checkoutservice.PlaceOrder, so checkoutservice->paymentservice and
     checkoutservice->cartservice are invisible unless checkout is actually
     submitted. Uses one requests.Session so the cart-session cookie survives
-    across the add-to-cart and checkout calls. Assumes the NodePort is
-    reachable at localhost, i.e. that KTMGuard is running on a cluster node;
-    silently gives up on request errors since this is auxiliary, not required
-    for tap itself to work."""
-    base = f"http://localhost:{node_port}"
+    across the add-to-cart and checkout calls. target_host is resolved from
+    the active kubeconfig (see _resolve_traffic_target_host) rather than
+    assumed to be localhost, so this also works when KTMGuard runs from a
+    separate client machine against a remote cluster (SETUP.md's
+    remote-client scenario) - 'localhost' there reaches nothing, and the
+    auto-generator would silently produce zero traffic, degrading --tap and
+    --prometheus detection alike without any visible error. Silently gives
+    up on request errors since this is auxiliary, not required for tap
+    itself to work."""
+    base = f"http://{target_host}:{node_port}"
     end_time = time.time() + duration
     while time.time() < end_time and not stop_event.is_set():
         try:
@@ -387,7 +429,7 @@ def _generate_frontend_traffic(node_port, duration, stop_event):
         stop_event.wait(1)
 
 
-def run_linkerd_tap(namespace, duration, known_names, node_port=None):
+def run_linkerd_tap(namespace, duration, known_names, node_port=None, target_host="localhost"):
     """Runs `linkerd viz tap deploy -n <namespace> --output json` for `duration`
     seconds and decodes each JSON tap event's source/destination deployment
     into a src -> dst edge. Returns (edges, warning); on any failure to start
@@ -401,10 +443,11 @@ def run_linkerd_tap(namespace, duration, known_names, node_port=None):
     nothing to observe. Edges on opaque ports can only be recovered from
     TCP-level Prometheus metrics (see detect_communication_paths), never
     from tap, regardless of how much traffic is generated."""
-    if not _linkerd_cli_available():
-        return [], "linkerd CLI not found on PATH; skipping tap-based detection."
+    linkerd_bin = _linkerd_binary_path()
+    if not linkerd_bin:
+        return [], "linkerd CLI not found on PATH or in ~/.linkerd2/bin; skipping tap-based detection."
 
-    cmd = ["linkerd", "viz", "tap", "deploy", "-n", namespace, "--output", "json"]
+    cmd = [linkerd_bin, "viz", "tap", "deploy", "-n", namespace, "--output", "json"]
     try:
         proc = subprocess.Popen(
             cmd, stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, text=True
@@ -442,7 +485,7 @@ def run_linkerd_tap(namespace, duration, known_names, node_port=None):
     if node_port:
         traffic_thread = threading.Thread(
             target=_generate_frontend_traffic,
-            args=(node_port, duration, stop_event),
+            args=(target_host, node_port, duration, stop_event),
             daemon=True,
         )
         traffic_thread.start()
@@ -620,12 +663,14 @@ def cmd_scan(args):
             print()
         else:
             node_port = _frontend_node_port(services)
+            target_host = _resolve_traffic_target_host()
             print(f"Observing live traffic for {args.tap_duration} seconds "
                   "(move through the app to generate traffic)...")
             if node_port:
-                print(f"Auto-generating traffic to frontend NodePort {node_port}.")
+                print(f"Auto-generating traffic to {target_host}:{node_port} "
+                      "(resolved from the active kubeconfig's API server host).")
             tap_edges, tap_warning = run_linkerd_tap(
-                args.namespace, args.tap_duration, known_names, node_port
+                args.namespace, args.tap_duration, known_names, node_port, target_host
             )
             if tap_warning:
                 print(yellow(f"Warning: {tap_warning}"))
