@@ -11,6 +11,25 @@ KTMGuard automates the two most error-prone steps in adopting Zero Trust on Kube
 
 It also includes `verify` (confirms the policy is applied and reports connectivity, with documented limitations — see below) and `report` (produces a Markdown summary).
 
+### Which Detection Method for Which Adoption Tier
+
+`scan` supports three detection methods, matching the thesis's tiered Zero Trust adoption roadmap:
+
+| Method | Flag | Needs a mesh installed? | Roadmap tier |
+|---|---|---|---|
+| Static configuration inference | `--static` | No | **Level 1** — NetworkPolicy-only |
+| Prometheus metrics | `--prometheus <url>` | Yes (Linkerd + its Prometheus) | **Level 1+** — NetworkPolicy + Linkerd mTLS |
+| Live tap | `--tap` | Yes (Linkerd CLI) | **Level 1+** |
+
+**If you have not installed a service mesh yet, start with `--static` alone.** It reads Deployment env vars and any ConfigMap values they reference via `envFrom`, and matches those values against known Service names in the namespace (e.g. an env var set to `cartservice:7070` or `cartservice.boutique.svc.cluster.local` both match the `cartservice` Service). This is exactly how most Kubernetes applications already declare their own dependencies, so it typically finds real edges immediately, with zero cluster prerequisites beyond `kubectl` access — see Part 3 below for the exact command.
+
+Every edge `scan` finds is tagged with which method(s) found it:
+- **HIGH CONFIDENCE** — corroborated by 2+ methods
+- **UNCONFIRMED** — found only by `--static`: documented, but no traffic observed confirming it's actually used
+- **OBSERVED ONLY** — found only by `--tap`/`--prometheus`, with no matching `--static` declaration: traffic is happening that isn't documented in any env var or ConfigMap — worth investigating before assuming it's intentional
+
+`generate` carries this straight through into a comment on each generated policy.
+
 ## Prerequisites
 
 - A running Kubernetes cluster with Linkerd installed and the target namespace injected (see the lab repository's `SETUP.md`)
@@ -18,6 +37,8 @@ It also includes `verify` (confirms the policy is applied and reports connectivi
 - Python 3.10+
 
 KTMGuard does **not** need to run on the cluster's own node. It works identically from any machine with `kubectl` access to the cluster — see the "Remote Client Setup" section below.
+
+If you're starting with `--static` detection only (no mesh installed yet), that's all you need — `kubectl` access and Python. The Linkerd CLI and Prometheus port-forward steps below are only required for `--tap`/`--prometheus`.
 
 ## Part 1 — Local Installation (Same Machine as the Cluster)
 
@@ -151,13 +172,25 @@ All commands below work identically whether run locally on the cluster node or f
 
 ### Scan
 
+**Level 1 — no mesh installed:**
+
 ```bash
-python3 ktmguard.py scan --namespace boutique --prometheus http://localhost:9091 --tap --tap-duration 30
+python3 ktmguard.py scan --namespace boutique --static
 ```
 
+Works purely by reading Deployment env vars / ConfigMaps — no traffic, no Linkerd, no Prometheus needed. Every edge it finds is tagged `UNCONFIRMED` (documented, but not yet confirmed by observed traffic) unless corroborated below.
+
+**Level 1+ — combine all three once Linkerd is installed:**
+
+```bash
+python3 ktmguard.py scan --namespace boutique --static --prometheus http://localhost:9091 --tap --tap-duration 30
+```
+
+- `--static` infers edges from configuration alone (see "Which Detection Method for Which Adoption Tier" above) — safe to always include, since it needs no mesh/Prometheus access to run.
 - `--tap` observes live traffic directly via the Linkerd CLI, in addition to Prometheus metrics. Recommended when available — it detects communication paths that Prometheus's historical metrics can miss.
-- If `linkerd` is not installed on the machine running KTMGuard, the tool degrades gracefully and falls back to Prometheus-only detection, printing a warning rather than failing.
-- Traffic must actually be occurring during the scan window for edges to be detected. If your application is idle, generate some traffic first (e.g., loading the frontend a few times) or rely on `--tap`'s built-in auto-traffic-generation against the frontend's NodePort.
+- If `linkerd` is not installed on the machine running KTMGuard, `--tap` degrades gracefully and is skipped, printing a warning rather than failing.
+- Traffic must actually be occurring during the scan window for `--tap`/`--prometheus` to detect an edge. If your application is idle, generate some traffic first (e.g., loading the frontend a few times) or rely on `--tap`'s built-in auto-traffic-generation against the frontend's NodePort.
+- Edges found by more than one method print as `HIGH CONFIDENCE`; a `--tap`/`--prometheus`-only edge with no matching `--static` declaration prints as `OBSERVED ONLY` — treat that as a signal to check whether that traffic is actually supposed to be happening.
 
 Output is written to `ktmguard-output/.state/service-map.json`.
 
@@ -238,3 +271,4 @@ If you do choose to expose it directly, restrict the security group rule to your
 | `verify` reports every connection as `BLOCKED`, including known-allowed paths | A prior redesign of the connectivity probe relied on Linkerd proxy metrics that don't reliably populate for all traffic patterns | Use the current version, which defaults to a documented TCP-layer check and flags its own limitation rather than guessing |
 | `P256 point not on curve` when using a remote kubeconfig | Certificate data corrupted during manual copy-paste through a terminal | Transfer the kubeconfig with `scp` instead, never by pasting base64 content directly |
 | `linkerd viz tap` returns a 404 from a remote client | The Kubernetes aggregated API path for the Tap APIService did not resolve correctly from that client's network path | Fall back to Prometheus-only detection (omit `--tap`); this is a known limitation of tap-based detection from certain remote network configurations |
+| `--static` finds fewer edges than expected | It only matches values a container actually references directly — a value pulled from a Secret (deliberately never read, for security) or an individually-mapped `valueFrom.configMapKeyRef` env var (rather than a literal value or a whole `envFrom` ConfigMap) won't be seen | Cross-check with `--tap`/`--prometheus` once a mesh is available; an edge that's real but invisible to `--static` will show as `OBSERVED ONLY` rather than `UNCONFIRMED` |

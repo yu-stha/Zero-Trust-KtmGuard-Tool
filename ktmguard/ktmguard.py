@@ -463,6 +463,96 @@ def run_linkerd_tap(namespace, duration, known_names, node_port=None):
 
 
 # --------------------------------------------------------------------------
+# Static configuration inference (optional, --static)
+# --------------------------------------------------------------------------
+
+def _service_name_matches(value, known_names):
+    """Return the first known service name substring-matched inside `value`,
+    so forms like 'cartservice:7070' or
+    'cartservice.boutique.svc.cluster.local' both match service 'cartservice'."""
+    if not value:
+        return None
+    value_lower = value.lower()
+    for name in known_names:
+        if name.lower() in value_lower:
+            return name
+    return None
+
+
+def detect_static_edges(apps_v1, core_v1, namespace, known_names):
+    """Infers src -> dst edges with no traffic, mesh, or Prometheus access at
+    all: substring-matches each Deployment's container env var values (and
+    any ConfigMap values pulled in via envFrom) against known Service names.
+    This is the only detection method that works before Linkerd is even
+    installed. Secrets are intentionally never read here."""
+    edges = {}
+    configmap_cache = {}
+
+    for dep in apps_v1.list_namespaced_deployment(namespace).items:
+        src = dep.metadata.name
+        if src not in known_names:
+            continue
+        for container in (dep.spec.template.spec.containers or []):
+            for env_var in (container.env or []):
+                dst = _service_name_matches(env_var.value, known_names)
+                if dst and dst != src:
+                    edges.setdefault((src, dst), env_var.name)
+
+            for env_from in (container.env_from or []):
+                cm_ref = env_from.config_map_ref
+                if not cm_ref or not cm_ref.name:
+                    continue
+                cm_name = cm_ref.name
+                if cm_name not in configmap_cache:
+                    try:
+                        cm = core_v1.read_namespaced_config_map(cm_name, namespace)
+                        configmap_cache[cm_name] = cm.data or {}
+                    except ApiException:
+                        configmap_cache[cm_name] = {}
+                for key, value in configmap_cache[cm_name].items():
+                    dst = _service_name_matches(value, known_names)
+                    if dst and dst != src:
+                        edges.setdefault((src, dst), key)
+
+    return [
+        {"src": s, "dst": d, "source_field": field}
+        for (s, d), field in sorted(edges.items())
+    ]
+
+
+# --------------------------------------------------------------------------
+# Detection-confidence scoring (combines static / tap / Prometheus results)
+# --------------------------------------------------------------------------
+
+METHOD_STATIC = "static-inference"
+METHOD_TAP = "linkerd-tap"
+METHOD_PROMETHEUS = "prometheus-metrics"
+
+CONFIDENCE_HIGH = "high-confidence"
+CONFIDENCE_UNCONFIRMED = "unconfirmed"
+CONFIDENCE_OBSERVED_ONLY = "observed-only"
+
+
+def _confidence_for(methods):
+    """methods is a sorted list of detection method names that found this edge."""
+    if len(methods) >= 2:
+        return CONFIDENCE_HIGH
+    if methods == [METHOD_STATIC]:
+        return CONFIDENCE_UNCONFIRMED
+    return CONFIDENCE_OBSERVED_ONLY
+
+
+def _confidence_label(confidence):
+    if confidence == CONFIDENCE_HIGH:
+        return green("HIGH CONFIDENCE")
+    if confidence == CONFIDENCE_UNCONFIRMED:
+        return yellow("UNCONFIRMED - no traffic observed yet, review before applying")
+    if confidence == CONFIDENCE_OBSERVED_ONLY:
+        return yellow("OBSERVED ONLY - no config reference found, verify this path is intentional")
+    return ""
+
+
+# --------------------------------------------------------------------------
 # scan
 # --------------------------------------------------------------------------
 
@@ -497,10 +587,28 @@ def cmd_scan(args):
         print(yellow(
             f"Warning: {', '.join(unmeshed)} have no linkerd-proxy sidecar. "
             "Traffic to/from these services has no mTLS identity or proxy "
-            "metrics and will never appear as a detected edge, regardless of "
-            "how much traffic is generated. Annotate for injection and run "
+            "metrics and will never appear as a detected edge via Prometheus "
+            "or tap, regardless of how much traffic is generated. Static "
+            "configuration inference (--static) is unaffected by this. "
+            "Annotate for injection and run "
             "'kubectl rollout restart deploy/<name>', then re-scan."
         ))
+        print()
+
+    combined = {}
+
+    def record_edge(src, dst, method, source_field=None):
+        entry = combined.setdefault((src, dst), {"methods": set(), "static_source_field": None})
+        entry["methods"].add(method)
+        if source_field:
+            entry["static_source_field"] = source_field
+
+    if args.static:
+        static_edges = detect_static_edges(apps_v1, v1, args.namespace, known_names)
+        for e in static_edges:
+            record_edge(e["src"], e["dst"], METHOD_STATIC, e["source_field"])
+        print(f"Static configuration inference: {len(static_edges)} candidate "
+              "path(s) found from Deployment env vars / ConfigMaps.")
         print()
 
     tap_edges = []
@@ -522,27 +630,39 @@ def cmd_scan(args):
             if tap_warning:
                 print(yellow(f"Warning: {tap_warning}"))
             print()
+    for e in tap_edges:
+        record_edge(e["src"], e["dst"], METHOD_TAP)
 
-    edges, manual_review, warning = detect_communication_paths(
-        args.prometheus, args.namespace, services
-    )
+    warning = None
+    if args.prometheus:
+        prom_edges, _prom_manual_review, warning = detect_communication_paths(
+            args.prometheus, args.namespace, services
+        )
+        for e in prom_edges:
+            record_edge(e["src"], e["dst"], METHOD_PROMETHEUS)
+    elif not (args.static or args.tap):
+        warning = (
+            "No detection method specified (--static, --tap, or --prometheus); "
+            "listing services only. Manual review of communication paths is required."
+        )
 
-    if tap_edges:
-        combined = {(e["src"], e["dst"]): True for e in edges}
-        new_from_tap = sum(1 for e in tap_edges if (e["src"], e["dst"]) not in combined)
-        for e in tap_edges:
-            combined[(e["src"], e["dst"])] = True
-        edges = [{"src": s, "dst": d} for (s, d) in sorted(combined.keys())]
-        if new_from_tap:
-            print(f"Linkerd tap detected {new_from_tap} additional path(s) "
-                  "not seen in Prometheus metrics.")
-            print()
+    edges = []
+    for (src, dst), info in sorted(combined.items()):
+        methods = sorted(info["methods"])
+        edges.append({
+            "src": src,
+            "dst": dst,
+            "methods": methods,
+            "static_source_field": info["static_source_field"],
+            "confidence": _confidence_for(methods),
+        })
+
+    manual_review = len(edges) == 0
 
     if edges:
-        manual_review = False
         print("Detected communication paths:")
         for e in edges:
-            print(f"  {e['src']:<22}→ {e['dst']}")
+            print(f"  {e['src']:<22}→ {e['dst']:<22}[{_confidence_label(e['confidence'])}]")
     else:
         print("No communication paths detected.")
     print()
@@ -593,11 +713,33 @@ def _service_ports(service):
     ]
 
 
+def _confidence_comment(edge):
+    """Renders an edge's detection confidence as a YAML comment string, or
+    None for edges from service-map.json files predating confidence scoring."""
+    confidence = edge.get("confidence")
+    if not confidence:
+        return None
+    methods = edge.get("methods") or []
+    if confidence == CONFIDENCE_HIGH:
+        return f"HIGH CONFIDENCE: corroborated by multiple detection methods ({', '.join(methods)})"
+    if confidence == CONFIDENCE_UNCONFIRMED:
+        field = edge.get("static_source_field")
+        basis = f" ({field})" if field else ""
+        return (f"UNCONFIRMED{basis}: based on env var / ConfigMap reference only, "
+                "no traffic observed yet - verify before relying on this in production")
+    if confidence == CONFIDENCE_OBSERVED_ONLY:
+        return ("OBSERVED ONLY: traffic was seen but no matching config reference was "
+                "found - verify this path is intentional before allowing it")
+    return None
+
+
 def build_allow_policies(namespace, edges, services):
     docs = []
+    comments = []
 
     for edge in edges:
         src, dst = edge["src"], edge["dst"]
+        comment = _confidence_comment(edge)
         src_svc = services.get(src)
         dst_svc = services.get(dst)
         src_selector = src_svc["selector"] if src_svc else {"app": src}
@@ -617,6 +759,7 @@ def build_allow_policies(namespace, edges, services):
                 "egress": [egress_rule],
             },
         })
+        comments.append(comment)
 
         ingress_rule = {"from": [{"podSelector": {"matchLabels": src_selector}}]}
         if ports:
@@ -631,6 +774,7 @@ def build_allow_policies(namespace, edges, services):
                 "ingress": [ingress_rule],
             },
         })
+        comments.append(comment)
 
     # DNS egress for all pods
     docs.append({
@@ -685,16 +829,22 @@ def build_allow_policies(namespace, edges, services):
             }],
         },
     })
+    comments.append(None)
+    comments.append(None)
+    comments.append(None)
 
-    return docs
+    return docs, comments
 
 
 def build_linkerd_auth_policies(namespace, edges, services):
     callers_by_dst = {}
+    edge_lookup = {}
     for edge in edges:
         callers_by_dst.setdefault(edge["dst"], set()).add(edge["src"])
+        edge_lookup[(edge["src"], edge["dst"])] = edge
 
     docs = []
+    comments = []
     protected_count = 0
     for dst, callers in sorted(callers_by_dst.items()):
         dst_svc = services.get(dst)
@@ -704,6 +854,15 @@ def build_linkerd_auth_policies(namespace, edges, services):
 
         server_name = f"{dst}-server"
         authn_name = f"{dst}-callers"
+
+        caller_tags = []
+        for caller in sorted(callers):
+            edge = edge_lookup.get((caller, dst), {})
+            confidence = edge.get("confidence")
+            caller_tags.append(f"{caller} [{confidence}]" if confidence else caller)
+        group_comment = f"Callers: {', '.join(caller_tags)}" if any(
+            edge_lookup.get((c, dst), {}).get("confidence") for c in callers
+        ) else None
 
         docs.append({
             "apiVersion": "policy.linkerd.io/v1beta1",
@@ -715,6 +874,7 @@ def build_linkerd_auth_policies(namespace, edges, services):
                 "proxyProtocol": "HTTP/2",
             },
         })
+        comments.append(group_comment)
 
         identities = [
             f"{caller}.{namespace}.serviceaccount.identity.linkerd.cluster.local"
@@ -726,6 +886,7 @@ def build_linkerd_auth_policies(namespace, edges, services):
             "metadata": {"name": authn_name, "namespace": namespace},
             "spec": {"identities": identities},
         })
+        comments.append(group_comment)
 
         docs.append({
             "apiVersion": "policy.linkerd.io/v1alpha1",
@@ -744,9 +905,10 @@ def build_linkerd_auth_policies(namespace, edges, services):
                 }],
             },
         })
+        comments.append(group_comment)
         protected_count += 1
 
-    return docs, protected_count
+    return docs, protected_count, comments
 
 
 def build_readme(namespace, edge_count):
@@ -802,8 +964,16 @@ then re-run `ktmguard scan` to capture the missed path and regenerate.
 """
 
 
-def yaml_dump_all(docs):
-    return yaml.dump_all(docs, default_flow_style=False, sort_keys=False, explicit_start=True)
+def yaml_dump_all(docs, comments=None):
+    parts = []
+    for i, doc in enumerate(docs):
+        comment = comments[i] if comments else None
+        chunk = "---\n"
+        if comment:
+            chunk += f"# {comment}\n"
+        chunk += yaml.dump(doc, default_flow_style=False, sort_keys=False)
+        parts.append(chunk)
+    return "".join(parts)
 
 
 # --------------------------------------------------------------------------
@@ -835,29 +1005,31 @@ def cmd_generate(args):
         print()
 
     deny_all_doc = build_deny_all(namespace)
-    allow_docs = build_allow_policies(namespace, edges, services)
-    linkerd_docs, protected_count = build_linkerd_auth_policies(namespace, edges, services)
+    allow_docs, allow_comments = build_allow_policies(namespace, edges, services)
+    linkerd_docs, protected_count, linkerd_comments = build_linkerd_auth_policies(
+        namespace, edges, services
+    )
     readme = build_readme(namespace, len(edges))
 
     plan = [
-        ("deny-all.yaml", [deny_all_doc], None),
-        ("allow-policies.yaml", allow_docs, f"{len(allow_docs)} rules"),
-        ("linkerd-auth-policy.yaml", linkerd_docs, f"{protected_count} policies"),
+        ("deny-all.yaml", [deny_all_doc], None, None),
+        ("allow-policies.yaml", allow_docs, f"{len(allow_docs)} rules", allow_comments),
+        ("linkerd-auth-policy.yaml", linkerd_docs, f"{protected_count} policies", linkerd_comments),
     ]
 
     if args.dry_run:
-        for name, docs, _ in plan:
+        for name, docs, _note, comments in plan:
             print(f"--- {name} ---")
-            print(yaml_dump_all(docs))
+            print(yaml_dump_all(docs, comments))
         print("--- README-apply.md ---")
         print(readme)
         return
 
     os.makedirs(OUTPUT_DIR, exist_ok=True)
-    for name, docs, note in plan:
+    for name, docs, note, comments in plan:
         path = os.path.join(OUTPUT_DIR, name)
         with open(path, "w") as f:
-            f.write(yaml_dump_all(docs))
+            f.write(yaml_dump_all(docs, comments))
         suffix = f" ({note})" if note else ""
         print(f"{name:<32}  created{suffix}")
 
@@ -1212,10 +1384,12 @@ def cmd_report(args):
         if service_map.get("manual_review_required"):
             lines.append("- **Manual review flagged**: automatic path detection was incomplete.")
         lines.append("")
-        lines.append("| Source | Destination |")
-        lines.append("|---|---|")
+        lines.append("| Source | Destination | Confidence | Methods |")
+        lines.append("|---|---|---|---|")
         for e in service_map.get("edges", []):
-            lines.append(f"| {e['src']} | {e['dst']} |")
+            confidence = e.get("confidence", "-")
+            methods = ", ".join(e.get("methods", [])) or "-"
+            lines.append(f"| {e['src']} | {e['dst']} | {confidence} | {methods} |")
     else:
         lines.append("_No service-map.json found. Run 'ktmguard scan' first._")
     lines.append("")
@@ -1278,6 +1452,9 @@ def build_parser():
                               "edges missing from Prometheus metrics")
     p_scan.add_argument("--tap-duration", type=int, default=30,
                          help="Seconds to observe traffic when --tap is set (default: 30)")
+    p_scan.add_argument("--static", action="store_true",
+                         help="Infer edges from Deployment env vars / ConfigMaps referencing "
+                              "known service names - works with no mesh or Prometheus installed")
     p_scan.set_defaults(func=cmd_scan)
 
     p_gen = sub.add_parser("generate", help="Generate Zero Trust YAML configuration")
