@@ -407,26 +407,63 @@ def _generate_frontend_traffic(target_host, node_port, duration, stop_event):
     the active kubeconfig (see _resolve_traffic_target_host) rather than
     assumed to be localhost, so this also works when KTMGuard runs from a
     separate client machine against a remote cluster (SETUP.md's
-    remote-client scenario) - 'localhost' there reaches nothing, and the
-    auto-generator would silently produce zero traffic, degrading --tap and
-    --prometheus detection alike without any visible error. Silently gives
-    up on request errors since this is auxiliary, not required for tap
-    itself to work."""
+    remote-client scenario) - 'localhost' there reaches nothing.
+
+    requests only raises an exception for connection-level failures
+    (timeout, refused, DNS) - an HTTP error status (4xx/5xx) is returned
+    as a normal response, not an exception, unless raise_for_status() is
+    called. A bare except-and-continue around the whole request sequence
+    would silently treat "the app rejected this POST every time" the same
+    as "it worked," producing zero real backend traffic while looking
+    like it ran successfully. So each step's status code is checked
+    explicitly and tallied, and a one-line summary is printed at the end
+    - this is the only way to tell "generated real traffic" apart from
+    "silently failed the whole window" from the scan output alone."""
     base = f"http://{target_host}:{node_port}"
     end_time = time.time() + duration
+    stats = {"get": [0, 0], "cart": [0, 0], "checkout": [0, 0]}  # [ok, not-ok] per step
+    last_issue = None
+    cycles = 0
+
     while time.time() < end_time and not stop_event.is_set():
+        cycles += 1
+        session = requests.Session()
         try:
-            session = requests.Session()
-            session.get(f"{base}/", timeout=2)
-            session.post(
+            resp = session.get(f"{base}/", timeout=2)
+            if resp.status_code < 400:
+                stats["get"][0] += 1
+            else:
+                stats["get"][1] += 1
+                last_issue = f"GET / -> HTTP {resp.status_code}"
+
+            resp = session.post(
                 f"{base}/cart",
                 data={"product_id": CHECKOUT_PRODUCT_ID, "quantity": "1"},
                 timeout=2,
             )
-            session.post(f"{base}/cart/checkout", data=CHECKOUT_FORM_DATA, timeout=2)
-        except requests.exceptions.RequestException:
-            pass
+            if resp.status_code < 400:
+                stats["cart"][0] += 1
+            else:
+                stats["cart"][1] += 1
+                last_issue = f"POST /cart -> HTTP {resp.status_code}"
+
+            resp = session.post(f"{base}/cart/checkout", data=CHECKOUT_FORM_DATA, timeout=2)
+            if resp.status_code < 400:
+                stats["checkout"][0] += 1
+            else:
+                stats["checkout"][1] += 1
+                last_issue = f"POST /cart/checkout -> HTTP {resp.status_code}"
+        except requests.exceptions.RequestException as exc:
+            last_issue = f"{type(exc).__name__}: {exc}"
         stop_event.wait(1)
+
+    print(
+        f"Traffic generator: {cycles} cycle(s) against {base} - "
+        f"GET / {stats['get'][0]}/{cycles} ok, "
+        f"POST /cart {stats['cart'][0]}/{cycles} ok, "
+        f"POST /cart/checkout {stats['checkout'][0]}/{cycles} ok."
+        + (f" Last issue: {last_issue}" if last_issue else "")
+    )
 
 
 def run_linkerd_tap(namespace, duration, known_names, node_port=None, target_host="localhost"):
