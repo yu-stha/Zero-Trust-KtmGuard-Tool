@@ -918,6 +918,37 @@ def build_allow_policies(namespace, edges, services):
     return docs, comments
 
 
+# Ports Linkerd's proxy cannot parse as HTTP/gRPC. Marking a Server's
+# proxyProtocol as "opaque" (a documented value on the Server CRD, alongside
+# "HTTP/1"/"HTTP/2"/"gRPC"/"TLS") tells the proxy to pass the connection
+# through as plain TCP instead of attempting HTTP-layer parsing - required
+# for these to work at all once meshed. Getting this wrong doesn't show up
+# in NetworkPolicy or AuthorizationPolicy checks (both are satisfied), and
+# pods still report 2/2 Running - the failure happens at the proxy's
+# protocol-parsing layer, invisible to every check `verify` runs, and only
+# shows up as the real application breaking after apply.
+OPAQUE_PORTS = {
+    6379: "Redis",
+    5432: "PostgreSQL",
+    3306: "MySQL",
+    27017: "MongoDB",
+    9042: "Cassandra",
+    11211: "Memcached",
+    5672: "RabbitMQ (AMQP)",
+    1433: "SQL Server",
+}
+
+
+def _proxy_protocol_for(port):
+    try:
+        port_num = int(port)
+    except (TypeError, ValueError):
+        return "HTTP/2"
+    if port_num in OPAQUE_PORTS:
+        return "opaque"
+    return "HTTP/2"
+
+
 def build_linkerd_auth_policies(namespace, edges, services):
     callers_by_dst = {}
     edge_lookup = {}
@@ -953,7 +984,7 @@ def build_linkerd_auth_policies(namespace, edges, services):
             "spec": {
                 "podSelector": {"matchLabels": selector},
                 "port": port,
-                "proxyProtocol": "HTTP/2",
+                "proxyProtocol": _proxy_protocol_for(port),
             },
         })
         comments.append(group_comment)
@@ -1018,6 +1049,17 @@ Namespace: `{namespace}`
    identity strings in `linkerd-auth-policy.yaml`
    (`<serviceaccount>.{namespace}.serviceaccount.identity.linkerd.cluster.local`).
    Adjust them if a workload uses a non-default service account.
+4. Each `Server` in `linkerd-auth-policy.yaml` has a `proxyProtocol` field.
+   Destinations on well-known database/cache ports (Redis, Postgres, MySQL,
+   MongoDB, etc.) are set to `opaque`, since Linkerd cannot parse those wire
+   protocols as HTTP - everything else defaults to `HTTP/2`. If a
+   destination speaks a non-HTTP protocol on a port not in that well-known
+   list, change its `proxyProtocol` to `opaque` by hand before applying;
+   leaving `HTTP/2` set for non-HTTP traffic breaks that connection outright
+   even though NetworkPolicy and AuthorizationPolicy are both configured
+   correctly, since the failure happens at the proxy's protocol-parsing
+   layer, not the policy layer - `verify`'s checks (and pods reporting 2/2
+   Running) will not catch this.
 
 ## Apply steps
 
