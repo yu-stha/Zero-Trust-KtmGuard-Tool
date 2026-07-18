@@ -418,12 +418,22 @@ def _generate_frontend_traffic(target_host, node_port, duration, stop_event):
     like it ran successfully. So each step's status code is checked
     explicitly and tallied, and a one-line summary is printed at the end
     - this is the only way to tell "generated real traffic" apart from
-    "silently failed the whole window" from the scan output alone."""
+    "silently failed the whole window" from the scan output alone. A
+    failure also captures a snippet of the response body: Online
+    Boutique's frontend often writes the underlying backend error
+    directly into the response (e.g. a cartservice/Redis dial timeout),
+    which is what actually distinguishes "this payload is wrong" from
+    "the payload is fine but a downstream dependency is broken" -
+    without it, a 500 here looks identical either way."""
     base = f"http://{target_host}:{node_port}"
     end_time = time.time() + duration
     stats = {"get": [0, 0], "cart": [0, 0], "checkout": [0, 0]}  # [ok, not-ok] per step
     last_issue = None
     cycles = 0
+
+    def _describe_failure(step, resp):
+        snippet = resp.text[:200].replace("\n", " ").strip() if resp.text else ""
+        return f"{step} -> HTTP {resp.status_code}" + (f" | body: {snippet}" if snippet else "")
 
     while time.time() < end_time and not stop_event.is_set():
         cycles += 1
@@ -434,7 +444,7 @@ def _generate_frontend_traffic(target_host, node_port, duration, stop_event):
                 stats["get"][0] += 1
             else:
                 stats["get"][1] += 1
-                last_issue = f"GET / -> HTTP {resp.status_code}"
+                last_issue = _describe_failure("GET /", resp)
 
             resp = session.post(
                 f"{base}/cart",
@@ -445,14 +455,14 @@ def _generate_frontend_traffic(target_host, node_port, duration, stop_event):
                 stats["cart"][0] += 1
             else:
                 stats["cart"][1] += 1
-                last_issue = f"POST /cart -> HTTP {resp.status_code}"
+                last_issue = _describe_failure("POST /cart", resp)
 
             resp = session.post(f"{base}/cart/checkout", data=CHECKOUT_FORM_DATA, timeout=2)
             if resp.status_code < 400:
                 stats["checkout"][0] += 1
             else:
                 stats["checkout"][1] += 1
-                last_issue = f"POST /cart/checkout -> HTTP {resp.status_code}"
+                last_issue = _describe_failure("POST /cart/checkout", resp)
         except requests.exceptions.RequestException as exc:
             last_issue = f"{type(exc).__name__}: {exc}"
         stop_event.wait(1)
@@ -1477,6 +1487,97 @@ def cmd_verify(args):
 # report
 # --------------------------------------------------------------------------
 
+REPORT_HTML_STYLE = """
+:root {
+  --text: #1a1a1a;
+  --text-dim: #57606a;
+  --bg: #ffffff;
+  --accent: #1f6feb;
+  --border: #d0d7de;
+  --code-bg: #f6f8fa;
+  --row-alt: #f6f8fa;
+}
+* { box-sizing: border-box; }
+body {
+  margin: 0;
+  background: var(--bg);
+  color: var(--text);
+  font-family: -apple-system, "Segoe UI", Helvetica, Arial, sans-serif;
+  line-height: 1.55;
+}
+.report {
+  max-width: 860px;
+  margin: 0 auto;
+  padding: 2.5rem 2rem 4rem;
+}
+h1, h2, h3 { color: var(--text); font-weight: 600; line-height: 1.3; }
+h1 {
+  font-size: 1.7rem;
+  border-bottom: 2px solid var(--accent);
+  padding-bottom: 0.5rem;
+  margin: 0 0 1.2rem 0;
+}
+h2 {
+  font-size: 1.25rem;
+  color: var(--accent);
+  margin: 2rem 0 0.75rem 0;
+  border-bottom: 1px solid var(--border);
+  padding-bottom: 0.3rem;
+}
+h3 { font-size: 1.05rem; margin: 1.5rem 0 0.5rem 0; }
+p { margin: 0.6rem 0; }
+a { color: var(--accent); text-decoration: none; }
+a:hover { text-decoration: underline; }
+ul, ol { padding-left: 1.4rem; }
+li { margin: 0.25rem 0; }
+strong { font-weight: 600; }
+em { color: var(--text-dim); }
+hr { border: none; border-top: 1px solid var(--border); margin: 2rem 0; }
+code {
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", Menlo, monospace;
+  background: var(--code-bg);
+  padding: 0.15rem 0.4rem;
+  border-radius: 4px;
+  font-size: 0.88em;
+}
+pre {
+  background: var(--code-bg);
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  padding: 1rem;
+  overflow-x: auto;
+}
+pre code { background: none; padding: 0; }
+table { border-collapse: collapse; width: 100%; margin: 1rem 0; font-size: 0.92rem; }
+th, td { border: 1px solid var(--border); padding: 0.5rem 0.75rem; text-align: left; }
+th { background: var(--row-alt); font-weight: 600; }
+tbody tr:nth-child(even) { background: var(--row-alt); }
+""".strip()
+
+
+def _render_report_html(namespace, markdown_content):
+    """Converts the same Markdown content cmd_report already builds into a
+    self-contained HTML document - same underlying report, different
+    presentation. Uses the `markdown` library already required for the
+    dashboard, imported here rather than at module load so the plain-CLI
+    path (--format markdown, the default) never needs it installed."""
+    try:
+        import markdown as markdown_lib
+    except ImportError:
+        print(red("Error: the 'markdown' package is not installed."))
+        print("Run: pip install -r requirements.txt")
+        sys.exit(1)
+
+    body = markdown_lib.markdown(markdown_content, extensions=["tables"])
+    return (
+        "<!DOCTYPE html>\n"
+        '<html lang="en">\n<head>\n<meta charset="UTF-8">\n'
+        f"<title>Zero Trust Configuration Report - {namespace}</title>\n"
+        f"<style>\n{REPORT_HTML_STYLE}\n</style>\n</head>\n<body>\n"
+        f'<div class="report">\n{body}\n</div>\n</body>\n</html>\n'
+    )
+
+
 def cmd_report(args):
     header(f"Generating Zero Trust report for namespace: {args.namespace}")
 
@@ -1551,10 +1652,20 @@ def cmd_report(args):
         "on Zero Trust feasibility for Kathmandu Valley SMEs._"
     )
 
-    with open(args.output, "w") as f:
-        f.write("\n".join(lines) + "\n")
+    markdown_content = "\n".join(lines) + "\n"
 
-    print(f"Report written to {args.output}")
+    output_path = args.output
+    if output_path is None:
+        output_path = "report.html" if args.format == "html" else "report.md"
+
+    if args.format == "html":
+        with open(output_path, "w", encoding="utf-8") as f:
+            f.write(_render_report_html(args.namespace, markdown_content))
+    else:
+        with open(output_path, "w") as f:
+            f.write(markdown_content)
+
+    print(f"Report written to {output_path}")
 
 
 # --------------------------------------------------------------------------
@@ -1591,9 +1702,13 @@ def build_parser():
     p_verify.add_argument("--namespace", required=True)
     p_verify.set_defaults(func=cmd_verify)
 
-    p_report = sub.add_parser("report", help="Generate a markdown summary report")
+    p_report = sub.add_parser("report", help="Generate a namespace summary report")
     p_report.add_argument("--namespace", required=True)
-    p_report.add_argument("--output", default="report.md")
+    p_report.add_argument("--output", default=None,
+                           help="Output file path (default: report.md or report.html, "
+                                "matching --format)")
+    p_report.add_argument("--format", choices=["markdown", "html"], default="markdown",
+                           help="Output format (default: markdown)")
     p_report.set_defaults(func=cmd_report)
 
     return parser

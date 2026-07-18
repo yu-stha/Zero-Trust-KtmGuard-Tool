@@ -618,6 +618,15 @@ table.result-table th.sort-active .sort-arrow { color: var(--accent); }
 .report-html code { background: var(--bg-panel); }
 .report-html h1, .report-html h2, .report-html h3 { color: var(--text); }
 
+.report-iframe {
+  width: 100%;
+  height: 640px;
+  border: 1px solid var(--border);
+  border-radius: 6px;
+  margin-top: 0.6rem;
+  background: #ffffff;
+}
+
 .download-btn {
   display: inline-block;
   margin-top: 0.6rem;

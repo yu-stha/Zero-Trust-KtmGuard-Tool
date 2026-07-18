@@ -695,9 +695,18 @@
   // ---------------------------------------------------------------------
 
   document.getElementById("run-report").addEventListener("click", () => {
-    const payload = { namespace: namespaceEl.value.trim() };
+    const format = document.getElementById("report-format-html").checked ? "html" : "markdown";
+    const payload = { namespace: namespaceEl.value.trim(), format };
     runAction("report", payload, "report-results", renderReportResults);
   });
+
+  // Escaping rules for an HTML attribute value differ from tag content:
+  // only `&` and the quote character delimiting the attribute need
+  // escaping - `<`/`>` are literal text inside an attribute value, and
+  // escaping them would corrupt the raw markup srcdoc is meant to render.
+  function escapeAttr(s) {
+    return String(s).replace(/&/g, "&amp;").replace(/"/g, "&quot;");
+  }
 
   function renderReportResults() {
     fetch("/api/report-result")
@@ -706,6 +715,16 @@
         const el = document.getElementById("report-results");
         if (!data.available) {
           el.innerHTML = '<p class="hint">No report found.</p>';
+          return;
+        }
+        if (data.format === "html") {
+          // report.html is already a complete, self-contained document
+          // (built server-side in ktmguard.py) - an iframe with srcdoc
+          // renders it exactly as it would look opened directly as a
+          // file, with its own styling isolated from the dashboard's.
+          el.innerHTML =
+            `<iframe class="report-iframe" srcdoc="${escapeAttr(data.html_document)}"></iframe>` +
+            '<a class="download-btn" href="/api/report-download">Download .html</a>';
           return;
         }
         el.innerHTML =

@@ -317,10 +317,16 @@ A timeout or error response confirms the block; a normal response confirms the p
 ### Report
 
 ```bash
-python3 ktmguard.py report --namespace boutique --output report.md
+python3 ktmguard.py report --namespace boutique --format markdown
+python3 ktmguard.py report --namespace boutique --format html
 ```
 
-Combines the results of the most recent `scan` and `verify` into a single Markdown summary.
+Combines the results of the most recent `scan` and `verify` into a single summary. `--format` accepts `markdown` (default, unchanged behavior) or `html`:
+
+- `markdown` writes `report.md` by default - the same plain-Markdown output as before.
+- `html` writes `report.html` by default - the same content converted to a self-contained HTML document with embedded CSS, openable directly in a browser with no other files or network access needed.
+
+`--output <path>` still works with either format to name the file explicitly; when omitted, the default filename's extension (`.md` / `.html`) follows whichever `--format` you chose.
 
 ## Part 4 — Web Dashboard (Optional)
 

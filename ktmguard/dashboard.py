@@ -53,7 +53,8 @@ BASE_DIR = Path(__file__).resolve().parent
 KTMGUARD_PY = BASE_DIR / "ktmguard.py"
 OUTPUT_DIR = BASE_DIR / "ktmguard-output"
 STATE_DIR = OUTPUT_DIR / ".state"
-REPORT_PATH = OUTPUT_DIR / "report.md"
+REPORT_MD_PATH = OUTPUT_DIR / "report.md"
+REPORT_HTML_PATH = OUTPUT_DIR / "report.html"
 PASSWORD_FILE = BASE_DIR / ".dashboard_password"
 SECRET_KEY_FILE = BASE_DIR / ".dashboard_secret_key"
 GENERATED_YAML_FILES = ("deny-all.yaml", "allow-policies.yaml", "linkerd-auth-policy.yaml")
@@ -68,6 +69,7 @@ app.config["SESSION_COOKIE_SAMESITE"] = "Lax"
 # own auth files below. "Defaults to last used" holds for the lifetime of
 # this process, not across restarts.
 _last_namespace = "boutique"
+_last_report_format = "markdown"
 
 _lock = threading.Lock()
 _job = {
@@ -500,7 +502,7 @@ def overview():
 
 @app.route("/api/run/<action>", methods=["POST"])
 def run_action(action):
-    global _last_namespace
+    global _last_namespace, _last_report_format
     payload = request.get_json(silent=True) or {}
 
     with _lock:
@@ -551,10 +553,16 @@ def run_action(action):
         namespace = (payload.get("namespace") or "").strip()
         if not namespace:
             return jsonify({"error": "Namespace is required."}), 400
+        report_format = payload.get("format") or "markdown"
+        if report_format not in ("markdown", "html"):
+            return jsonify({"error": "format must be 'markdown' or 'html'."}), 400
         _last_namespace = namespace
+        _last_report_format = report_format
+        output_path = REPORT_HTML_PATH if report_format == "html" else REPORT_MD_PATH
         cmd = _ktmguard_cmd(
             "report", "--namespace", namespace,
-            "--output", str(REPORT_PATH),
+            "--format", report_format,
+            "--output", str(output_path),
         )
 
     else:
@@ -738,21 +746,35 @@ def verify_result():
 
 @app.route("/api/report-result")
 def report_result():
-    if not REPORT_PATH.exists():
+    if _last_report_format == "html":
+        # report.html is already a complete, self-contained document (built
+        # by _render_report_html in ktmguard.py) - handed back as-is for the
+        # frontend to embed via an iframe, rather than re-parsed here.
+        if not REPORT_HTML_PATH.exists():
+            return jsonify({"available": False})
+        try:
+            html_document = REPORT_HTML_PATH.read_text()
+        except OSError:
+            return jsonify({"available": False})
+        return jsonify({"available": True, "format": "html", "html_document": html_document})
+
+    if not REPORT_MD_PATH.exists():
         return jsonify({"available": False})
     try:
-        raw = REPORT_PATH.read_text()
+        raw = REPORT_MD_PATH.read_text()
     except OSError:
         return jsonify({"available": False})
     html = markdown_lib.markdown(raw, extensions=["tables"])
-    return jsonify({"available": True, "html": html})
+    return jsonify({"available": True, "format": "markdown", "html": html})
 
 
 @app.route("/api/report-download")
 def report_download():
-    if not REPORT_PATH.exists():
+    path = REPORT_HTML_PATH if _last_report_format == "html" else REPORT_MD_PATH
+    if not path.exists():
         return jsonify({"error": "No report has been generated yet."}), 404
-    return send_file(str(REPORT_PATH), as_attachment=True, download_name="report.md")
+    download_name = "report.html" if _last_report_format == "html" else "report.md"
+    return send_file(str(path), as_attachment=True, download_name=download_name)
 
 
 if __name__ == "__main__":
